@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { getVerifyIssues, getServices } from "@/lib/services";
+import { AO_ISSUE_LABELS } from "@/lib/issue-labels";
 import { validateConfiguredProject } from "@/lib/validation";
 import type { Tracker } from "@aoagents/ao-core";
 
@@ -26,14 +27,12 @@ export async function GET() {
  */
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json().catch(() => null)) as
-      | {
-          issueId?: string;
-          projectId?: string;
-          action?: "verify" | "fail";
-          comment?: string;
-        }
-      | null;
+    const body = (await req.json().catch(() => null)) as {
+      issueId?: string;
+      projectId?: string;
+      action?: "verify" | "fail";
+      comment?: string;
+    } | null;
     if (!body) {
       return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
@@ -52,10 +51,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (action !== "verify" && action !== "fail") {
-      return NextResponse.json(
-        { error: 'action must be "verify" or "fail"' },
-        { status: 400 },
-      );
+      return NextResponse.json({ error: 'action must be "verify" or "fail"' }, { status: 400 });
     }
 
     const { config, registry } = await getServices();
@@ -78,8 +74,8 @@ export async function POST(req: NextRequest) {
         issueId,
         {
           state: "closed",
-          labels: ["verified", "agent:done"],
-          removeLabels: ["merged-unverified"],
+          labels: [AO_ISSUE_LABELS.VERIFIED, AO_ISSUE_LABELS.DONE],
+          removeLabels: [AO_ISSUE_LABELS.MERGED_UNVERIFIED],
           comment: comment || "Verified — fix confirmed on staging.",
         },
         project,
@@ -88,8 +84,8 @@ export async function POST(req: NextRequest) {
       await tracker.updateIssue(
         issueId,
         {
-          labels: ["verification-failed"],
-          removeLabels: ["merged-unverified"],
+          labels: [AO_ISSUE_LABELS.VERIFICATION_FAILED],
+          removeLabels: [AO_ISSUE_LABELS.MERGED_UNVERIFIED],
           comment: comment || "Verification failed — problem persists on staging.",
         },
         project,

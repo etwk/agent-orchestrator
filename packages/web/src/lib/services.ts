@@ -31,6 +31,7 @@ import {
   isOrchestratorSession,
   TERMINAL_STATUSES,
 } from "@aoagents/ao-core";
+import { AO_ISSUE_LABELS } from "./issue-labels";
 
 // Static plugin imports — webpack needs these to be string literals
 import pluginRuntimeTmux from "@aoagents/ao-plugin-runtime-tmux";
@@ -153,13 +154,15 @@ function loadDashboardConfig(): LoadedConfig {
 // Backlog auto-claim — polls for labeled issues and auto-spawns agents
 // ---------------------------------------------------------------------------
 
-const BACKLOG_LABEL = "agent:backlog";
+const BACKLOG_LABEL = AO_ISSUE_LABELS.BACKLOG;
+const MERGED_UNVERIFIED_LABEL = AO_ISSUE_LABELS.MERGED_UNVERIFIED;
 const BACKLOG_POLL_INTERVAL = 60_000; // 1 minute
 const MAX_CONCURRENT_AGENTS = 5; // Max active agent sessions across all projects
 
 const globalForBacklog = globalThis as typeof globalThis & {
   _aoBacklogStarted?: boolean;
   _aoBacklogTimer?: ReturnType<typeof setInterval>;
+  _aoBacklogPollInFlight?: boolean;
 };
 
 /** Start the backlog auto-claim loop. Idempotent — safe to call multiple times. */
@@ -172,8 +175,12 @@ export function startBacklogPoller(): void {
   globalForBacklog._aoBacklogTimer = setInterval(() => void pollBacklog(), BACKLOG_POLL_INTERVAL);
 }
 
-// Track which issues we've already processed to avoid repeated API calls
+// Track which merged sessions we've already processed to avoid repeated API calls
 const processedIssues = new Set<string>();
+
+function processedIssueKey(session: Pick<Session, "id" | "projectId" | "issueId">): string {
+  return `${session.projectId}:${session.issueId ?? ""}:${session.id}`;
+}
 
 /** Label GitHub issues for verification when their PRs have been merged. */
 async function labelIssuesForVerification(
@@ -183,13 +190,11 @@ async function labelIssuesForVerification(
 ): Promise<void> {
   const mergedSessions = sessions.filter(
     (s) =>
-      s.lifecycle.pr.state === "merged" &&
-      s.issueId &&
-      !processedIssues.has(`${s.projectId}:${s.issueId}`),
+      s.lifecycle.pr.state === "merged" && s.issueId && !processedIssues.has(processedIssueKey(s)),
   );
 
   for (const session of mergedSessions) {
-    const key = `${session.projectId}:${session.issueId}`;
+    const key = processedIssueKey(session);
     const project = config.projects[session.projectId];
     if (!project?.tracker?.plugin) {
       processedIssues.add(key);
@@ -209,19 +214,35 @@ async function labelIssuesForVerification(
     }
 
     try {
+      if (await tracker.isCompleted(issueId, project)) {
+        processedIssues.add(key);
+        continue;
+      }
+
+      const issue = await tracker.getIssue(issueId, project);
+      if (issue.labels.includes(MERGED_UNVERIFIED_LABEL)) {
+        processedIssues.add(key);
+        continue;
+      }
+
+      if (issue.labels.includes(AO_ISSUE_LABELS.DONE)) {
+        processedIssues.add(key);
+        continue;
+      }
+
       await tracker.updateIssue(
         issueId,
         {
-          labels: ["merged-unverified"],
-          removeLabels: ["agent:backlog", "agent:in-progress"],
+          labels: [MERGED_UNVERIFIED_LABEL],
+          removeLabels: [AO_ISSUE_LABELS.BACKLOG, AO_ISSUE_LABELS.IN_PROGRESS],
           comment: `PR merged. Issue awaiting human verification on staging.`,
         },
         project,
       );
+      processedIssues.add(key);
     } catch (err) {
-      console.error(`[backlog] Failed to close issue ${session.issueId}:`, err);
+      console.error(`[backlog] Failed to mark issue ${session.issueId} for verification:`, err);
     }
-    processedIssues.add(key);
   }
 }
 
@@ -241,7 +262,7 @@ async function relabelReopenedIssues(
     let reopened: Issue[];
     try {
       reopened = await tracker.listIssues(
-        { state: "open", labels: ["agent:done"], limit: 20 },
+        { state: "open", labels: [AO_ISSUE_LABELS.DONE], limit: 20 },
         project,
       );
     } catch {
@@ -254,7 +275,7 @@ async function relabelReopenedIssues(
           issue.id,
           {
             labels: [BACKLOG_LABEL],
-            removeLabels: ["agent:done"],
+            removeLabels: [AO_ISSUE_LABELS.DONE],
             comment: "Issue reopened — returning to agent backlog.",
           },
           project,
@@ -268,6 +289,9 @@ async function relabelReopenedIssues(
 }
 
 export async function pollBacklog(): Promise<void> {
+  if (globalForBacklog._aoBacklogPollInFlight) return;
+  globalForBacklog._aoBacklogPollInFlight = true;
+
   try {
     const { config, registry, sessionManager } = await getServices();
 
@@ -334,8 +358,8 @@ export async function pollBacklog(): Promise<void> {
             await tracker.updateIssue(
               issue.id,
               {
-                labels: ["agent:in-progress"],
-                removeLabels: ["agent:backlog"],
+                labels: [AO_ISSUE_LABELS.IN_PROGRESS],
+                removeLabels: [AO_ISSUE_LABELS.BACKLOG],
                 comment: "Claimed by agent orchestrator — session spawned.",
               },
               project,
@@ -348,6 +372,8 @@ export async function pollBacklog(): Promise<void> {
     }
   } catch (err) {
     console.error("[backlog] Poll failed:", err);
+  } finally {
+    globalForBacklog._aoBacklogPollInFlight = false;
   }
 }
 
@@ -391,7 +417,7 @@ export async function getVerifyIssues(): Promise<Array<Issue & { projectId: stri
 
       try {
         const issues = await tracker.listIssues(
-          { state: "open", labels: ["merged-unverified"], limit: 20 },
+          { state: "open", labels: [MERGED_UNVERIFIED_LABEL], limit: 20 },
           project,
         );
         for (const issue of issues) {

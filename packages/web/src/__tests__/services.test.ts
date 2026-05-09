@@ -64,6 +64,7 @@ vi.mock("@aoagents/ao-core", () => ({
     getStates: vi.fn(),
     check: vi.fn(),
   }),
+  isOrchestratorSession: () => false,
   TERMINAL_STATUSES: new Set(["merged", "killed"]) as ReadonlySet<string>,
 }));
 
@@ -169,17 +170,29 @@ describe("services", () => {
 describe("pollBacklog", () => {
   const mockUpdateIssue = vi.fn();
   const mockListIssues = vi.fn();
+  const mockIsCompleted = vi.fn();
+  const mockGetIssue = vi.fn();
   const mockSpawn = vi.fn();
+  const mockSessionList = vi.fn();
 
   beforeEach(async () => {
     vi.resetModules();
     mockRegister.mockClear();
+    mockRegistry.get.mockReset();
     mockCreateSessionManager.mockReset();
     mockLoadConfig.mockReset();
-    mockUpdateIssue.mockClear();
-    mockListIssues.mockClear();
-    mockSpawn.mockClear();
+    mockUpdateIssue.mockReset();
+    mockListIssues.mockReset();
+    mockIsCompleted.mockReset();
+    mockGetIssue.mockReset();
+    mockSpawn.mockReset();
+    mockSessionList.mockReset();
 
+    delete (
+      globalThis as typeof globalThis & {
+        _aoBacklogPollInFlight?: unknown;
+      }
+    )._aoBacklogPollInFlight;
     mockLoadConfig.mockReturnValue({
       configPath: "/tmp/agent-orchestrator.yaml",
       port: 3000,
@@ -199,7 +212,7 @@ describe("pollBacklog", () => {
 
     mockCreateSessionManager.mockReturnValue({
       spawn: mockSpawn,
-      list: vi.fn().mockResolvedValue([]),
+      list: mockSessionList.mockResolvedValue([]),
     });
 
     delete (globalThis as typeof globalThis & { _aoServices?: unknown })._aoServices;
@@ -209,25 +222,33 @@ describe("pollBacklog", () => {
   afterEach(() => {
     delete (globalThis as typeof globalThis & { _aoServices?: unknown })._aoServices;
     delete (globalThis as typeof globalThis & { _aoServicesInit?: unknown })._aoServicesInit;
+    delete (
+      globalThis as typeof globalThis & {
+        _aoBacklogPollInFlight?: unknown;
+      }
+    )._aoBacklogPollInFlight;
   });
 
   it("removes agent:backlog label when claiming an issue", async () => {
-    mockListIssues.mockResolvedValue([
-      {
-        id: "123",
-        title: "Test Issue",
-        description: "Test description",
-        url: "https://github.com/test/test/issues/123",
-        state: "open",
-        labels: ["agent:backlog"],
-      },
-    ]);
+    const backlogIssue = {
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: ["agent:backlog"],
+    };
+    mockListIssues.mockImplementation(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:backlog") ? [backlogIssue] : [],
+    );
 
     mockRegistry.get.mockImplementation((slot: string) => {
       if (slot === "tracker") {
         return {
           name: "github",
           listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
           updateIssue: mockUpdateIssue,
         };
       }
@@ -255,5 +276,340 @@ describe("pollBacklog", () => {
       },
       expect.objectContaining({ tracker: { plugin: "github" } }),
     );
+  });
+
+  it("does not mark already-completed merged-session issues for verification", async () => {
+    mockSessionList.mockResolvedValue([
+      {
+        id: "test-1",
+        projectId: "test-project",
+        issueId: "28",
+        status: "merged",
+        metadata: {},
+        lifecycle: { pr: { state: "merged" } },
+      },
+    ]);
+    mockIsCompleted.mockResolvedValue(true);
+    mockListIssues.mockResolvedValue([]);
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    await pollBacklog();
+
+    expect(mockIsCompleted).toHaveBeenCalledWith(
+      "28",
+      expect.objectContaining({ tracker: { plugin: "github" } }),
+    );
+    expect(mockUpdateIssue).not.toHaveBeenCalledWith(
+      "28",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("marks open merged-session issues for verification", async () => {
+    mockSessionList.mockResolvedValue([
+      {
+        id: "test-1",
+        projectId: "test-project",
+        issueId: "123",
+        status: "merged",
+        metadata: {},
+        lifecycle: { pr: { state: "merged" } },
+      },
+    ]);
+    mockIsCompleted.mockResolvedValue(false);
+    mockGetIssue.mockResolvedValue({
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: [],
+    });
+    mockListIssues.mockResolvedValue([]);
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    await pollBacklog();
+
+    expect(mockUpdateIssue).toHaveBeenCalledWith(
+      "123",
+      {
+        labels: ["merged-unverified"],
+        removeLabels: ["agent:backlog", "agent:in-progress"],
+        comment: "PR merged. Issue awaiting human verification on staging.",
+      },
+      expect.objectContaining({ tracker: { plugin: "github" } }),
+    );
+  });
+
+  it("retries marking merged-session issues after tracker update failures", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    mockSessionList.mockResolvedValue([
+      {
+        id: "test-1",
+        projectId: "test-project",
+        issueId: "123",
+        status: "merged",
+        metadata: {},
+        lifecycle: { pr: { state: "merged" } },
+      },
+    ]);
+    mockIsCompleted.mockResolvedValue(false);
+    mockGetIssue.mockResolvedValue({
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: [],
+    });
+    mockListIssues.mockResolvedValue([]);
+    mockUpdateIssue.mockRejectedValueOnce(new Error("transient")).mockResolvedValueOnce(undefined);
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    try {
+      await pollBacklog();
+      await pollBacklog();
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(mockUpdateIssue).toHaveBeenCalledTimes(2);
+  });
+
+  it("allows a new merged session for the same reopened issue to be marked for verification", async () => {
+    const oldSession = {
+      id: "test-old",
+      projectId: "test-project",
+      issueId: "123",
+      status: "merged",
+      metadata: {},
+      lifecycle: { pr: { state: "merged" } },
+    };
+    const newSession = {
+      id: "test-new",
+      projectId: "test-project",
+      issueId: "123",
+      status: "merged",
+      metadata: {},
+      lifecycle: { pr: { state: "merged" } },
+    };
+    mockSessionList
+      .mockResolvedValueOnce([oldSession])
+      .mockResolvedValueOnce([oldSession, newSession]);
+    mockIsCompleted.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    mockGetIssue.mockResolvedValue({
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: [],
+    });
+    mockListIssues.mockResolvedValue([]);
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    await pollBacklog();
+    await pollBacklog();
+
+    expect(mockUpdateIssue).toHaveBeenCalledWith(
+      "123",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.objectContaining({ tracker: { plugin: "github" } }),
+    );
+  });
+
+  it("does not re-comment merged-session issues already awaiting verification", async () => {
+    mockSessionList.mockResolvedValue([
+      {
+        id: "test-1",
+        projectId: "test-project",
+        issueId: "123",
+        status: "merged",
+        metadata: {},
+        lifecycle: { pr: { state: "merged" } },
+      },
+    ]);
+    mockIsCompleted.mockResolvedValue(false);
+    mockGetIssue.mockResolvedValue({
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: ["merged-unverified"],
+    });
+    mockListIssues.mockResolvedValue([]);
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    await pollBacklog();
+
+    expect(mockUpdateIssue).not.toHaveBeenCalledWith(
+      "123",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+  });
+
+  it("returns reopened completed issues to backlog instead of marking them for verification", async () => {
+    const consoleLog = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    mockSessionList.mockResolvedValue([
+      {
+        id: "test-1",
+        projectId: "test-project",
+        issueId: "123",
+        status: "merged",
+        metadata: {},
+        lifecycle: { pr: { state: "merged" } },
+      },
+    ]);
+    mockIsCompleted.mockResolvedValue(false);
+    mockGetIssue.mockResolvedValue({
+      id: "123",
+      title: "Test Issue",
+      description: "Test description",
+      url: "https://github.com/test/test/issues/123",
+      state: "open",
+      labels: ["agent:done"],
+    });
+    mockListIssues.mockImplementation(async (filters: { labels?: string[] }) =>
+      filters.labels?.includes("agent:done")
+        ? [
+            {
+              id: "123",
+              title: "Test Issue",
+              description: "Test description",
+              url: "https://github.com/test/test/issues/123",
+              state: "open",
+              labels: ["agent:done"],
+            },
+          ]
+        : [],
+    );
+
+    mockRegistry.get.mockImplementation((slot: string) => {
+      if (slot === "tracker") {
+        return {
+          name: "github",
+          listIssues: mockListIssues,
+          isCompleted: mockIsCompleted,
+          getIssue: mockGetIssue,
+          updateIssue: mockUpdateIssue,
+        };
+      }
+      return null;
+    });
+
+    const { pollBacklog } = await import("../lib/services");
+    try {
+      await pollBacklog();
+    } finally {
+      consoleLog.mockRestore();
+    }
+
+    expect(mockUpdateIssue).not.toHaveBeenCalledWith(
+      "123",
+      expect.objectContaining({ labels: ["merged-unverified"] }),
+      expect.anything(),
+    );
+    expect(mockUpdateIssue).toHaveBeenCalledWith(
+      "123",
+      {
+        labels: ["agent:backlog"],
+        removeLabels: ["agent:done"],
+        comment: "Issue reopened — returning to agent backlog.",
+      },
+      expect.objectContaining({ tracker: { plugin: "github" } }),
+    );
+  });
+
+  it("skips overlapping backlog poll runs", async () => {
+    let resolveList: (sessions: unknown[]) => void = () => undefined;
+    const listStarted = new Promise<void>((resolve) => {
+      mockSessionList.mockImplementationOnce(
+        () =>
+          new Promise((resolveSessionList) => {
+            resolveList = resolveSessionList as (sessions: unknown[]) => void;
+            resolve();
+          }),
+      );
+    });
+
+    mockRegistry.get.mockReturnValue(null);
+
+    const { pollBacklog } = await import("../lib/services");
+    const firstPoll = pollBacklog();
+    await listStarted;
+
+    await pollBacklog();
+
+    expect(mockSessionList).toHaveBeenCalledTimes(1);
+    resolveList([]);
+    await firstPoll;
   });
 });
