@@ -518,6 +518,9 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
       variables["filter"] = Object.keys(filter).length > 0 ? filter : undefined;
       variables["orderBy"] = oldestFirst ? "createdAt" : undefined;
       if (oldestFirst) {
+        // Linear's createdAt pagination returns the newest-created page first by
+        // default. Request the last page, then reverse it so callers receive the
+        // oldest matching issues first.
         variables["last"] = limit;
       } else {
         variables["first"] = limit;
