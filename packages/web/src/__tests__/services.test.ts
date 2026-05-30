@@ -322,6 +322,23 @@ describe("pollBacklog", () => {
     );
   });
 
+  it("requests backlog issues in FIFO creation order", async () => {
+    mockListIssues.mockResolvedValue([backlogIssue("100"), backlogIssue("101")]);
+    configureBacklogRegistry();
+
+    const { pollBacklog } = await import("../lib/services");
+    await pollBacklog();
+
+    expect(mockListIssues).toHaveBeenCalledWith(
+      { state: "open", labels: ["agent:backlog"], limit: 10, sort: "created-asc" },
+      expect.objectContaining({ tracker: { plugin: "github" } }),
+    );
+    expect(mockSpawn).toHaveBeenNthCalledWith(1, {
+      projectId: "test-project",
+      issueId: "100",
+    });
+  });
+
   it("deduplicates concurrent backlog polls", async () => {
     mockListIssues.mockResolvedValue([backlogIssue("123")]);
     mockSpawn.mockImplementation(() => new Promise((resolve) => setTimeout(resolve, 10)));

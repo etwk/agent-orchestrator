@@ -758,6 +758,8 @@ export interface IssueFilters {
   labels?: string[];
   assignee?: string;
   limit?: number;
+  /** Deterministic tracker ordering. `created-asc` is FIFO: oldest issue first. */
+  sort?: "created-asc";
 }
 
 export interface IssueUpdate {
