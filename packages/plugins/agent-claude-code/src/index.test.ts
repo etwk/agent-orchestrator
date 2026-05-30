@@ -78,6 +78,8 @@ import {
   toClaudeProjectPath,
   METADATA_UPDATER_SCRIPT,
   METADATA_UPDATER_SCRIPT_NODE,
+  ACTIVITY_UPDATER_SCRIPT,
+  ACTIVITY_UPDATER_SCRIPT_NODE,
 } from "./index.js";
 
 // ---------------------------------------------------------------------------
@@ -375,6 +377,45 @@ describe("isProcessRunning", () => {
     expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
   });
 
+  // Coverage for the broadened process regex — these are real install shapes
+  // the previous narrow regex `/(?:^|\/)claude(?:\s|$)/` would have missed,
+  // causing AO to declare sessions `exited` while Claude was still running.
+  it.each([
+    ["bare binary", "claude"],
+    ["absolute path", "/opt/homebrew/bin/claude"],
+    ["dot-prefix shim", "/usr/local/lib/.claude"],
+    ["windows exe", "claude.exe"],
+    ["js shim", "claude.js"],
+    ["hyphenated name", "claude-code"],
+    ["node-shim npm install", "node /opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"],
+  ])("returns true for %s (%s)", async (_label, args) => {
+    mockExecFileAsync.mockImplementation((cmd: string) => {
+      if (cmd === "tmux") return Promise.resolve({ stdout: "/dev/ttys001\n", stderr: "" });
+      if (cmd === "ps")
+        return Promise.resolve({
+          stdout: `  PID TT       ARGS\n  123 ttys001  ${args}\n`,
+          stderr: "",
+        });
+      return Promise.reject(new Error("unexpected"));
+    });
+    resetPsCache();
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(true);
+  });
+
+  it("still rejects look-alike names (claudia, claudine)", async () => {
+    mockExecFileAsync.mockImplementation((cmd: string) => {
+      if (cmd === "tmux") return Promise.resolve({ stdout: "/dev/ttys001\n", stderr: "" });
+      if (cmd === "ps")
+        return Promise.resolve({
+          stdout: "  PID TT       ARGS\n  123 ttys001  claudia\n  124 ttys001  /bin/claudine\n",
+          stderr: "",
+        });
+      return Promise.reject(new Error("unexpected"));
+    });
+    resetPsCache();
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
+  });
+
   it("returns false when tmux list-panes returns empty", async () => {
     mockExecFileAsync.mockResolvedValue({ stdout: "", stderr: "" });
     expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
@@ -402,9 +443,18 @@ describe("isProcessRunning", () => {
     expect(mockExecFileAsync).not.toHaveBeenCalled();
   });
 
-  it("returns false when tmux command fails", async () => {
+  it("returns indeterminate when tmux command fails", async () => {
     mockExecFileAsync.mockRejectedValue(new Error("fail"));
-    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe("indeterminate");
+  });
+
+  it("returns indeterminate when cached ps command fails", async () => {
+    mockExecFileAsync.mockImplementation((cmd: string) => {
+      if (cmd === "tmux") return Promise.resolve({ stdout: "/dev/ttys002\n", stderr: "" });
+      if (cmd === "ps") return Promise.reject(new Error("ps timed out"));
+      return Promise.reject(new Error("unexpected"));
+    });
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe("indeterminate");
   });
 
   it("returns true when PID exists but throws EPERM", async () => {
@@ -432,22 +482,6 @@ describe("isProcessRunning", () => {
     expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(true);
   });
 
-  it("does not match similar process names like claude-code", async () => {
-    mockExecFileAsync.mockImplementation((cmd: string, args: string[]) => {
-      if (cmd === "tmux" && args[0] === "list-panes") {
-        return Promise.resolve({ stdout: "/dev/ttys001\n", stderr: "" });
-      }
-      if (cmd === "ps") {
-        return Promise.resolve({
-          stdout: "  PID TT ARGS\n  100 ttys001  /usr/bin/claude-code\n",
-          stderr: "",
-        });
-      }
-      return Promise.reject(new Error("unexpected"));
-    });
-    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
-  });
-
   it("returns false for tmux handle on Windows without spawning ps", async () => {
     mockIsWindows.mockReturnValue(true);
     // ps should never be called — getCachedProcessList guards against Windows
@@ -461,7 +495,18 @@ describe("isProcessRunning", () => {
 // =========================================================================
 // detectActivity — terminal output classification
 // =========================================================================
-describe("detectActivity", () => {
+describe("detectActivity (retired — see #1941)", () => {
+  // Claude activity is derived from platform-event hooks (PermissionRequest,
+  // StopFailure, Notification, Stop, ...) which write directly to
+  // .ao/activity.jsonl with source: "hook". The terminal-regex layer was
+  // structurally fragile (every Claude UI tweak regressed it; #1932 spent
+  // 15 commits patching its sharpest edges) and has been retired.
+  //
+  // The `detectActivity` method is kept on the Agent interface for other
+  // plugins (Aider, OpenCode, Codex fallback) but is a stable no-signal
+  // stub for Claude — returns "idle" for every input so the lifecycle
+  // manager's terminal-output path stays neutral and the JSONL-backed
+  // cascade is the only source of truth for active/ready/waiting_input/blocked.
   const agent = create();
 
   it("returns idle for empty terminal output", () => {
@@ -472,70 +517,20 @@ describe("detectActivity", () => {
     expect(agent.detectActivity("   \n  \n  ")).toBe("idle");
   });
 
-  it("returns active when 'esc to interrupt' is visible", () => {
-    expect(agent.detectActivity("Working... esc to interrupt\n")).toBe("active");
-  });
-
-  it("returns active when Thinking indicator is visible", () => {
-    expect(agent.detectActivity("Thinking...\n")).toBe("active");
-  });
-
-  it("returns active when Reading indicator is visible", () => {
-    expect(agent.detectActivity("Reading file src/index.ts\n")).toBe("active");
-  });
-
-  it("returns active when Writing indicator is visible", () => {
-    expect(agent.detectActivity("Writing to src/main.ts\n")).toBe("active");
-  });
-
-  it("returns active when Searching indicator is visible", () => {
-    expect(agent.detectActivity("Searching codebase...\n")).toBe("active");
-  });
-
-  it("returns waiting_input for permission prompt (Y/N)", () => {
-    expect(agent.detectActivity("Do you want to proceed? (Y)es / (N)o\n")).toBe("waiting_input");
-  });
-
-  it("returns waiting_input for 'Do you want to proceed?' prompt", () => {
-    expect(agent.detectActivity("Do you want to proceed?\n")).toBe("waiting_input");
-  });
-
-  it("returns waiting_input for bypass permissions prompt", () => {
-    expect(agent.detectActivity("bypass all future permissions for this session\n")).toBe(
-      "waiting_input",
-    );
-  });
-
-  it("returns active when queued message indicator is visible", () => {
-    expect(agent.detectActivity("Press up to edit queued messages\n")).toBe("active");
-  });
-
-  it("returns idle when shell prompt is visible", () => {
-    expect(agent.detectActivity("some output\n> ")).toBe("idle");
-    expect(agent.detectActivity("some output\n$ ")).toBe("idle");
-  });
-
-  it("returns idle when prompt follows historical activity indicators", () => {
-    // Key regression test: historical "Reading file..." output in the buffer
-    // should NOT override an idle prompt on the last line.
-    expect(agent.detectActivity("Reading file src/index.ts\nWriting to out.ts\n❯ ")).toBe("idle");
-    expect(agent.detectActivity("Thinking...\nSearching codebase...\n$ ")).toBe("idle");
-  });
-
-  it("returns waiting_input when permission prompt follows historical activity", () => {
-    // Permission prompt at the bottom should NOT be overridden by historical
-    // "Reading"/"Thinking" output higher in the buffer.
-    expect(
-      agent.detectActivity("Reading file src/index.ts\nThinking...\nDo you want to proceed?\n"),
-    ).toBe("waiting_input");
-    expect(agent.detectActivity("Searching codebase...\n(Y)es / (N)o\n")).toBe("waiting_input");
-    expect(
-      agent.detectActivity("Writing to out.ts\nbypass all future permissions for this session\n"),
-    ).toBe("waiting_input");
-  });
-
-  it("returns active for non-empty output with no special patterns", () => {
-    expect(agent.detectActivity("some random terminal output\n")).toBe("active");
+  it.each([
+    "Working... esc to interrupt\n",
+    "Thinking...\n",
+    "Reading file src/index.ts\n",
+    "Writing to src/main.ts\n",
+    "Searching codebase...\n",
+    "Do you want to proceed? (Y)es / (N)o\n",
+    "bypass all future permissions for this session\n",
+    "  ⎿  Unable to connect to API (ConnectionRefused)\n",
+    "     Retrying in 19s · attempt 7/10\n",
+    "✻ Fluttering… (6m 49s · ↓ 26.9k tokens)\n",
+    "some random terminal output\n",
+  ])("returns idle for ALL non-empty input (no terminal-regex active/waiting_input/blocked): %s", (input) => {
+    expect(agent.detectActivity(input)).toBe("idle");
   });
 });
 
@@ -996,13 +991,280 @@ describe("hook setup — relative path (symlink-safe)", () => {
     );
     expect(scriptWrite).toBeDefined();
     expect(scriptWrite![0]).toBe(
-      pathJoin("/Users/equinox/.worktrees/integrator/integrator-5", ".claude", "metadata-updater.sh"),
+      pathJoin(
+        "/Users/equinox/.worktrees/integrator/integrator-5",
+        ".claude",
+        "metadata-updater.sh",
+      ),
     );
   });
 
   it("skips postLaunchSetup when workspacePath is null", async () => {
     await agent.postLaunchSetup!(makeSession({ workspacePath: null }));
     expect(mockWriteFile).not.toHaveBeenCalled();
+  });
+});
+
+// =========================================================================
+// setupWorkspaceHooks — activity-updater registration (#1941)
+// =========================================================================
+describe("setupWorkspaceHooks — activity-updater (#1941)", () => {
+  const agent = create();
+
+  function getParsedSettings(): Record<string, unknown> {
+    const settingsWrite = mockWriteFile.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("settings.json"),
+    );
+    expect(settingsWrite).toBeDefined();
+    return JSON.parse(settingsWrite![1] as string) as Record<string, unknown>;
+  }
+
+  /** Activity-updater command paths (unix vs win32) */
+  const ACTIVITY_CMD_UNIX = ".claude/activity-updater.sh";
+  const ACTIVITY_CMD_WIN = "node .claude/activity-updater.cjs";
+
+  /**
+   * Every Claude Code hook event the script knows how to translate into an
+   * activity state. The dashboard / lifecycle reducer relies on these firing
+   * so platform events replace terminal-output regex.
+   */
+  const ACTIVITY_EVENTS = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Notification",
+    "PermissionRequest",
+    "Stop",
+    "StopFailure",
+    "SubagentStart",
+    "SubagentStop",
+    "PreCompact",
+    "PostCompact",
+  ] as const;
+
+  it("writes the activity-updater script to .claude/", async () => {
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const scriptWrite = mockWriteFile.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("activity-updater.sh"),
+    );
+    expect(scriptWrite).toBeDefined();
+    expect(scriptWrite![1]).toBe(ACTIVITY_UPDATER_SCRIPT);
+  });
+
+  it("makes the activity-updater script executable on unix (chmod 0o755)", async () => {
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const chmodCall = mockChmod.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("activity-updater.sh"),
+    );
+    expect(chmodCall).toBeDefined();
+    expect(chmodCall![1]).toBe(0o755);
+  });
+
+  it.each(ACTIVITY_EVENTS)(
+    "registers the activity-updater hook on %s",
+    async (event) => {
+      mockWriteFile.mockClear();
+      await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+      const settings = getParsedSettings();
+      const hookGroup = (settings.hooks as Record<string, unknown>)[event] as Array<{
+        matcher: string;
+        hooks: Array<{ command: string; timeout?: number }>;
+      }>;
+      expect(hookGroup).toBeDefined();
+      const activity = hookGroup.flatMap((g) => g.hooks).find((h) => h.command === ACTIVITY_CMD_UNIX);
+      expect(activity).toBeDefined();
+      // The script does a single JSON parse + append — short timeout keeps a
+      // stuck hook from slowing the turn down.
+      expect(activity!.timeout).toBe(2000);
+    },
+  );
+
+  it("registers activity-updater PostToolUse alongside metadata-updater", async () => {
+    mockWriteFile.mockClear();
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const settings = getParsedSettings();
+    const postToolUse = (settings.hooks as Record<string, unknown>)["PostToolUse"] as Array<{
+      matcher: string;
+      hooks: Array<{ command: string }>;
+    }>;
+    expect(postToolUse.length).toBeGreaterThanOrEqual(2);
+
+    const metadataEntry = postToolUse.find((g) =>
+      g.hooks.some((h) => h.command.includes("metadata-updater")),
+    );
+    const activityEntry = postToolUse.find((g) =>
+      g.hooks.some((h) => h.command.includes("activity-updater")),
+    );
+
+    expect(metadataEntry).toBeDefined();
+    expect(metadataEntry!.matcher).toBe("Bash"); // unchanged from before #1941
+    expect(activityEntry).toBeDefined();
+    expect(activityEntry!.matcher).toBe(""); // fires on every PostToolUse, not just Bash
+  });
+
+  it("is idempotent — calling twice keeps exactly one activity-updater entry per event", async () => {
+    mockWriteFile.mockClear();
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+    const firstSettings = mockWriteFile.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("settings.json"),
+    );
+    mockExistsSync.mockReturnValueOnce(true);
+    mockReadFile.mockResolvedValueOnce(firstSettings![1] as string);
+    mockWriteFile.mockClear();
+
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const settings = getParsedSettings();
+    for (const event of ACTIVITY_EVENTS) {
+      const hookGroup = (settings.hooks as Record<string, unknown>)[event] as Array<{
+        hooks: Array<{ command: string }>;
+      }>;
+      const activityHooks = hookGroup.flatMap((g) => g.hooks).filter(
+        (h) => h.command === ACTIVITY_CMD_UNIX,
+      );
+      expect(activityHooks).toHaveLength(1);
+    }
+  });
+
+  it("preserves a user-installed Stop hook when adding our activity-updater", async () => {
+    const existingSettings = {
+      hooks: {
+        Stop: [
+          {
+            matcher: "",
+            hooks: [{ type: "command", command: "echo user-hook", timeout: 1000 }],
+          },
+        ],
+      },
+    };
+    mockExistsSync.mockReturnValueOnce(true);
+    mockReadFile.mockResolvedValueOnce(JSON.stringify(existingSettings));
+    mockWriteFile.mockClear();
+
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const settings = getParsedSettings();
+    const stopGroup = (settings.hooks as Record<string, unknown>)["Stop"] as Array<{
+      hooks: Array<{ command: string }>;
+    }>;
+    const commands = stopGroup.flatMap((g) => g.hooks).map((h) => h.command);
+    expect(commands).toContain("echo user-hook"); // user hook preserved
+    expect(commands).toContain(ACTIVITY_CMD_UNIX); // our hook added
+  });
+
+  it("tolerates malformed hooks.<event> (object instead of array)", async () => {
+    // A user could hand-edit settings.json or an older plugin could have
+    // written a non-array shape there. We must not crash — start fresh.
+    const malformed = {
+      hooks: {
+        // Object where an array is expected
+        Stop: { matcher: "", command: "broken" },
+      },
+    };
+    mockExistsSync.mockReturnValueOnce(true);
+    mockReadFile.mockResolvedValueOnce(JSON.stringify(malformed));
+    mockWriteFile.mockClear();
+
+    await expect(
+      agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig),
+    ).resolves.not.toThrow();
+
+    const settings = getParsedSettings();
+    const stopGroup = (settings.hooks as Record<string, unknown>)["Stop"] as Array<{
+      hooks: Array<{ command: string }>;
+    }>;
+    expect(Array.isArray(stopGroup)).toBe(true);
+    const commands = stopGroup.flatMap((g) => g.hooks).map((h) => h.command);
+    expect(commands).toContain(ACTIVITY_CMD_UNIX);
+  });
+
+  it("preserves matcher of an entry where user co-located their own def alongside ours", async () => {
+    // User has added their own hook def into the SAME { matcher, hooks: [...] }
+    // object that contains our activity-updater. If we naively reset
+    // entry.matcher to ours (""), the user's def starts firing on every
+    // PreToolUse event instead of only "Edit|Write".
+    const existingSettings = {
+      hooks: {
+        PreToolUse: [
+          {
+            matcher: "Edit|Write",
+            hooks: [
+              { type: "command", command: ".claude/activity-updater.sh", timeout: 2000 },
+              { type: "command", command: "echo user-edits-only", timeout: 1000 },
+            ],
+          },
+        ],
+      },
+    };
+    mockExistsSync.mockReturnValueOnce(true);
+    mockReadFile.mockResolvedValueOnce(JSON.stringify(existingSettings));
+    mockWriteFile.mockClear();
+
+    await agent.setupWorkspaceHooks!("/workspace/test", {} as WorkspaceHooksConfig);
+
+    const settings = getParsedSettings();
+    const pre = (settings.hooks as Record<string, unknown>)["PreToolUse"] as Array<{
+      matcher: string;
+      hooks: Array<{ command: string }>;
+    }>;
+    const sharedEntry = pre.find((g) =>
+      g.hooks.some((h) => h.command === "echo user-edits-only"),
+    );
+    expect(sharedEntry).toBeDefined();
+    // Matcher must NOT be overwritten — user's hook keeps firing on "Edit|Write"
+    expect(sharedEntry!.matcher).toBe("Edit|Write");
+    // Both defs still present
+    expect(sharedEntry!.hooks.map((h) => h.command)).toEqual([
+      ACTIVITY_CMD_UNIX,
+      "echo user-edits-only",
+    ]);
+  });
+
+  it("on Windows writes activity-updater.cjs (not .sh) and uses node invocation", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockWriteFile.mockClear();
+
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
+
+    const cjsWrite = mockWriteFile.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("activity-updater.cjs"),
+    );
+    expect(cjsWrite).toBeDefined();
+    expect(cjsWrite![1]).toBe(ACTIVITY_UPDATER_SCRIPT_NODE);
+
+    const shWrite = mockWriteFile.mock.calls.find(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("activity-updater.sh"),
+    );
+    expect(shWrite).toBeUndefined();
+
+    const settings = getParsedSettings();
+    const stopGroup = (settings.hooks as Record<string, unknown>)["Stop"] as Array<{
+      hooks: Array<{ command: string }>;
+    }>;
+    expect(stopGroup.flatMap((g) => g.hooks).some((h) => h.command === ACTIVITY_CMD_WIN)).toBe(true);
+
+    mockIsWindows.mockReturnValue(false);
+  });
+
+  it("does not chmod on Windows (Windows uses extension for executability)", async () => {
+    mockIsWindows.mockReturnValue(true);
+    mockChmod.mockClear();
+
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
+
+    const chmodCalls = mockChmod.mock.calls.filter(
+      ([path]: unknown[]) => typeof path === "string" && path.endsWith("activity-updater.cjs"),
+    );
+    expect(chmodCalls).toHaveLength(0);
+
+    mockIsWindows.mockReturnValue(false);
   });
 });
 
@@ -1039,10 +1301,7 @@ describe("setupWorkspaceHooks on win32", () => {
   });
 
   it("writes a Node.js hook script instead of bash on Windows", async () => {
-    await agent.setupWorkspaceHooks!(
-      "C:\\\\Users\\\\dev\\\\workspace",
-      {} as WorkspaceHooksConfig,
-    );
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
 
     // The .cjs file must have been written (.cjs forces CJS mode in ESM workspaces)
     const cjsContent = getWrittenScriptContent("metadata-updater.cjs");
@@ -1063,10 +1322,7 @@ describe("setupWorkspaceHooks on win32", () => {
   });
 
   it("uses node command in settings.json hook command on Windows", async () => {
-    await agent.setupWorkspaceHooks!(
-      "C:\\\\Users\\\\dev\\\\workspace",
-      {} as WorkspaceHooksConfig,
-    );
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
 
     const hookCommand = getWrittenHookCommand();
     expect(hookCommand).toBe("node .claude/metadata-updater.cjs");
@@ -1074,10 +1330,7 @@ describe("setupWorkspaceHooks on win32", () => {
   });
 
   it("skips chmod on win32", async () => {
-    await agent.setupWorkspaceHooks!(
-      "C:\\\\Users\\\\dev\\\\workspace",
-      {} as WorkspaceHooksConfig,
-    );
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
 
     expect(mockChmod).not.toHaveBeenCalled();
   });
@@ -1119,10 +1372,7 @@ describe("setupWorkspaceHooks on win32", () => {
 
   it("does not add duplicate hook entry when called twice on Windows", async () => {
     // First call creates the hook
-    await agent.setupWorkspaceHooks!(
-      "C:\\\\Users\\\\dev\\\\workspace",
-      {} as WorkspaceHooksConfig,
-    );
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
 
     // Simulate second call: settings.json now contains the .cjs hook
     const firstSettings = mockWriteFile.mock.calls.find(
@@ -1134,10 +1384,7 @@ describe("setupWorkspaceHooks on win32", () => {
     mockIsWindows.mockReturnValue(true);
 
     // Second call — should UPDATE the existing hook, not add a duplicate
-    await agent.setupWorkspaceHooks!(
-      "C:\\\\Users\\\\dev\\\\workspace",
-      {} as WorkspaceHooksConfig,
-    );
+    await agent.setupWorkspaceHooks!("C:\\\\Users\\\\dev\\\\workspace", {} as WorkspaceHooksConfig);
 
     const secondSettings = mockWriteFile.mock.calls.find(
       ([path]: unknown[]) => typeof path === "string" && path.endsWith("settings.json"),
@@ -1146,9 +1393,9 @@ describe("setupWorkspaceHooks on win32", () => {
     const parsed = JSON.parse(secondSettings![1] as string);
     const hookEntries = parsed.hooks.PostToolUse as Array<{ hooks: Array<{ command: string }> }>;
     // Count all hook commands matching our metadata updater
-    const metadataHooks = hookEntries.flatMap((e) => e.hooks).filter(
-      (h) => h.command.includes("metadata-updater"),
-    );
+    const metadataHooks = hookEntries
+      .flatMap((e) => e.hooks)
+      .filter((h) => h.command.includes("metadata-updater"));
     // Must be exactly 1 — no duplicates
     expect(metadataHooks).toHaveLength(1);
   });

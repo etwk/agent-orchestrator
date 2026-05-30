@@ -82,7 +82,7 @@ describe("SessionDetail merge conflict actions", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("link", { name: "PR #99" }));
+    fireEvent.click(screen.getByRole("link", { name: "PR details for #99" }));
 
     const compare = screen.getByRole("link", { name: /Compare with base branch/i });
     expect(compare).toHaveAttribute(
@@ -114,7 +114,7 @@ describe("SessionDetail merge conflict actions", () => {
       />,
     );
 
-    fireEvent.click(screen.getByRole("link", { name: "PR #100" }));
+    fireEvent.click(screen.getByRole("link", { name: "PR details for #100" }));
     expect(screen.queryByRole("link", { name: /Compare with base branch/i })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Copy head branch name/i })).not.toBeInTheDocument();
   });

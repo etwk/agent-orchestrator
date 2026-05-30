@@ -45,7 +45,7 @@ Agent Orchestrator manages fleets of AI coding agents working in parallel on you
 
 ## Quick Start
 
-> **Prerequisites:** [Node.js 20+](https://nodejs.org), [Git 2.25+](https://git-scm.com), [`gh` CLI](https://cli.github.com), and:
+> **Prerequisites:** [Node.js 20.18.3+](https://nodejs.org), [Git 2.25+](https://git-scm.com), [`gh` CLI](https://cli.github.com), and:
 > - **macOS / Linux:** [tmux](https://github.com/tmux/tmux/wiki/Installing) — install via `brew install tmux` or `sudo apt install tmux`.
 > - **Windows:** PowerShell 7+ recommended. tmux is **not** required — AO uses native ConPTY via the `runtime-process` plugin (the default on Windows). Set `AO_SHELL=bash` if you have Git Bash and prefer it.
 
@@ -54,6 +54,9 @@ Agent Orchestrator manages fleets of AI coding agents working in parallel on you
 ```bash
 npm install -g @aoagents/ao
 ```
+
+> **Nightly builds** (latest `main`, daily Fri–Tue): `npm install -g @aoagents/ao@nightly`
+> Back to stable: `npm install -g @aoagents/ao@latest`
 
 <details>
 <summary>Permission denied? Install from source?</summary>

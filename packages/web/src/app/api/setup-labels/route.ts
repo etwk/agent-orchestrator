@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { recordActivityEvent } from "@aoagents/ao-core";
 import { getServices } from "@/lib/services";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -88,6 +89,17 @@ export async function POST() {
         }
       }
     }
+
+    const created = results.filter((r) => r.status === "created").length;
+    const exists = results.filter((r) => r.status === "exists").length;
+    const failed = results.filter((r) => r.status === "failed").length;
+    recordActivityEvent({
+      source: "api",
+      kind: "api.labels_setup",
+      level: hasFailures ? "warn" : "info",
+      summary: `labels setup complete: ${created} created, ${exists} exists, ${failed} failed`,
+      data: { created, exists, failed, total: results.length },
+    });
 
     return NextResponse.json({ results }, { status: hasFailures ? 207 : 200 });
   } catch (err) {

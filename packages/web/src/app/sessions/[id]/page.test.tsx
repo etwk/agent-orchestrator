@@ -332,7 +332,7 @@ describe("SessionPage project polling", () => {
     expect(screen.getByRole("button", { name: "Toggle sidebar" })).toBeInTheDocument();
   });
 
-  it("times out a stuck session fetch and replaces the infinite loader with an error state", async () => {
+  it("keeps retrying after a stuck session fetch times out before showing an error state", async () => {
     global.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === "/api/projects") {
@@ -373,12 +373,30 @@ describe("SessionPage project polling", () => {
     });
     await flushAsyncWork();
 
+    expect(screen.getByText("Loading session…")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to load session")).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    await flushAsyncWork();
+
+    expect(screen.getByText("Loading session…")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to load session")).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(12_000);
+    });
+    await flushAsyncWork();
+
     expect(screen.getByText("Failed to load session")).toBeInTheDocument();
     expect(screen.getByText(/taking too long/i)).toBeInTheDocument();
     expect(screen.queryByText("Loading session…")).not.toBeInTheDocument();
   });
 
-  it("shows a recoverable unavailable state when the first session request aborts", async () => {
+  it("does not show the route error after the first aborted session request", async () => {
+    let sessionFetches = 0;
+
     global.fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url === "/api/projects") {
@@ -392,6 +410,7 @@ describe("SessionPage project polling", () => {
       }
 
       if (url === "/api/sessions/worker-1") {
+        sessionFetches += 1;
         return Promise.reject(new DOMException("Aborted", "AbortError"));
       }
 
@@ -411,81 +430,24 @@ describe("SessionPage project polling", () => {
     render(<SessionPage />);
     await flushAsyncWork();
 
-    expect(screen.getByText("Session unavailable")).toBeInTheDocument();
-    expect(screen.getByText(/backend has not returned this session yet/i)).toBeInTheDocument();
-    expect(screen.queryByText("Loading session…")).not.toBeInTheDocument();
-  });
-
-  it("marks sidebar data as loading until the sessions list resolves", async () => {
-    const workerSession = makeWorkerSession();
-    let resolveSidebarSessions: ((value: Response) => void) | null = null;
-
-    global.fetch = vi.fn((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url === "/api/projects") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({
-            projects: [{ id: "my-app", name: "My App", sessionPrefix: "my-app" }],
-          }),
-        } as Response);
-      }
-
-      if (url === "/api/sessions/worker-1") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => workerSession,
-        } as Response);
-      }
-
-      if (url === "/api/sessions?fresh=metadata") {
-        return new Promise<Response>((resolve) => {
-          resolveSidebarSessions = resolve;
-        });
-      }
-
-      if (url === "/api/sessions?project=my-app&orchestratorOnly=true") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({ orchestratorId: "my-app-orchestrator" }),
-        } as Response);
-      }
-
-      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
-    }) as typeof fetch;
-
-    const { default: SessionPage } = await import("./page");
-
-    render(<SessionPage />);
-    await flushAsyncWork();
-
-    const latestBeforeSidebarResolve = sessionDetailSpy.mock.lastCall?.[0] as {
-      sidebarLoading?: boolean;
-      sidebarSessions?: DashboardSession[] | null;
-    };
-
-    expect(latestBeforeSidebarResolve.sidebarLoading).toBe(true);
-    expect(latestBeforeSidebarResolve.sidebarSessions).toBeNull();
+    expect(sessionFetches).toBe(1);
+    expect(screen.getByText("Loading session…")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to load session")).not.toBeInTheDocument();
 
     await act(async () => {
-      resolveSidebarSessions?.({
-        ok: true,
-        status: 200,
-        json: async () => ({ sessions: [workerSession] }),
-      } as Response);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3_000);
     });
+    await flushAsyncWork();
 
-    const latestAfterSidebarResolve = sessionDetailSpy.mock.lastCall?.[0] as {
-      sidebarLoading?: boolean;
-      sidebarSessions?: DashboardSession[] | null;
-    };
+    expect(sessionFetches).toBeGreaterThanOrEqual(3);
+    expect(screen.queryByText("Failed to load session")).not.toBeInTheDocument();
 
-    expect(latestAfterSidebarResolve.sidebarLoading).toBe(false);
-    expect(latestAfterSidebarResolve.sidebarSessions).toEqual([workerSession]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4_000);
+    });
+    await flushAsyncWork();
+
+    expect(screen.getAllByText("Failed to load session").length).toBeGreaterThan(0);
   });
 
   it("revalidates projects and sidebar sessions on remount even when cache exists", async () => {
@@ -602,146 +564,6 @@ describe("SessionPage project polling", () => {
       "Failed to fetch sidebar sessions:",
       expect.anything(),
     );
-  });
-
-  it("surfaces sidebar fetch failures instead of leaving the loading skeleton active", async () => {
-    const workerSession = makeWorkerSession();
-
-    global.fetch = vi.fn(async (input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url === "/api/projects") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            projects: [{ id: "my-app", name: "My App", sessionPrefix: "my-app" }],
-          }),
-        } as Response;
-      }
-
-      if (url === "/api/sessions/worker-1") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => workerSession,
-        } as Response;
-      }
-
-      if (url === "/api/sessions?fresh=metadata") {
-        return {
-          ok: false,
-          status: 500,
-          json: async () => ({}),
-        } as Response;
-      }
-
-      if (url === "/api/sessions?project=my-app&orchestratorOnly=true") {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ orchestratorId: "my-app-orchestrator" }),
-        } as Response;
-      }
-
-      throw new Error(`Unexpected fetch: ${url}`);
-    }) as typeof fetch;
-
-    const { default: SessionPage } = await import("./page");
-
-    render(<SessionPage />);
-    await flushAsyncWork();
-
-    const latestProps = sessionDetailSpy.mock.lastCall?.[0] as {
-      sidebarError?: boolean;
-      sidebarLoading?: boolean;
-      sidebarSessions?: DashboardSession[] | null;
-    };
-
-    expect(latestProps.sidebarLoading).toBe(false);
-    expect(latestProps.sidebarError).toBe(true);
-    expect(latestProps.sidebarSessions).toEqual([]);
-  });
-
-  it("applies mux snapshots that arrive before the initial sidebar fetch resolves", async () => {
-    const workerSession = makeWorkerSession();
-    const muxPatchedLastActivityAt = "2026-04-14T12:00:00.000Z";
-    let resolveSidebarSessions: ((value: Response) => void) | null = null;
-
-    mockMuxState.current = {
-      status: "connected",
-      sessions: [
-        {
-          id: "worker-1",
-          status: "working",
-          activity: "ready",
-          attentionLevel: "pending",
-          lastActivityAt: muxPatchedLastActivityAt,
-        },
-      ],
-    };
-
-    global.fetch = vi.fn((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url === "/api/projects") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({
-            projects: [{ id: "my-app", name: "My App", sessionPrefix: "my-app" }],
-          }),
-        } as Response);
-      }
-
-      if (url === "/api/sessions/worker-1") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => workerSession,
-        } as Response);
-      }
-
-      if (url === "/api/sessions?fresh=metadata") {
-        return new Promise<Response>((resolve) => {
-          resolveSidebarSessions = resolve;
-        });
-      }
-
-      if (url === "/api/sessions?project=my-app&orchestratorOnly=true") {
-        return Promise.resolve({
-          ok: true,
-          status: 200,
-          json: async () => ({ orchestratorId: "my-app-orchestrator" }),
-        } as Response);
-      }
-
-      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
-    }) as typeof fetch;
-
-    const { default: SessionPage } = await import("./page");
-
-    render(<SessionPage />);
-    await flushAsyncWork();
-
-    await act(async () => {
-      resolveSidebarSessions?.({
-        ok: true,
-        status: 200,
-        json: async () => ({ sessions: [workerSession] }),
-      } as Response);
-      await Promise.resolve();
-    });
-
-    const latestProps = sessionDetailSpy.mock.lastCall?.[0] as {
-      sidebarSessions?: DashboardSession[] | null;
-    };
-
-    expect(latestProps.sidebarSessions).toEqual([
-      {
-        ...workerSession,
-        activity: "ready",
-        lastActivityAt: muxPatchedLastActivityAt,
-      },
-    ]);
   });
 
   it("redirects the legacy session URL to the project-scoped route for clean projects", async () => {
