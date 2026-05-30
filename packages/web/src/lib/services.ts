@@ -343,7 +343,7 @@ async function pollBacklogOnce(): Promise<void> {
       let backlogIssues: Issue[];
       try {
         backlogIssues = await tracker.listIssues(
-          { state: "open", labels: [BACKLOG_LABEL], limit: 10 },
+          { state: "open", labels: [BACKLOG_LABEL], limit: 10, sort: "created-asc" },
           project,
         );
       } catch {
