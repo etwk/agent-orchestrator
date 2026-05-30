@@ -49,7 +49,7 @@ function assertValidSessionId(id: string): void {
 const KEEP_ALIVE_SHELL = `exec "\${SHELL:-/bin/bash}" -i`;
 
 function withKeepAliveShell(command: string): string {
-  return `${command.replace(/\n+$/, "")}\n${KEEP_ALIVE_SHELL}`;
+  return `(\n${command.replace(/\n+$/, "")}\n)\n${KEEP_ALIVE_SHELL}`;
 }
 
 function writeLaunchScript(command: string): string {

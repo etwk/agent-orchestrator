@@ -109,7 +109,7 @@ describe("runtime.create()", () => {
         "test-session",
         "-c",
         "/tmp/workspace",
-        'echo hello\nexec "${SHELL:-/bin/bash}" -i',
+        '(\necho hello\n)\nexec "${SHELL:-/bin/bash}" -i',
       ],
       expectedTmuxOptions,
     );
@@ -157,7 +157,7 @@ describe("runtime.create()", () => {
     expect(args).toContain("-e");
     expect(args).toContain("AO_SESSION=env-session");
     expect(args).toContain("FOO=bar");
-    expect(args.at(-1)).toBe('bash\nexec "${SHELL:-/bin/bash}" -i');
+    expect(args.at(-1)).toBe('(\nbash\n)\nexec "${SHELL:-/bin/bash}" -i');
   });
 
   it("starts the launch command as the initial tmux pane command", async () => {
@@ -184,7 +184,7 @@ describe("runtime.create()", () => {
         "launch-test",
         "-c",
         "/tmp/ws",
-        'claude --session abc\nexec "${SHELL:-/bin/bash}" -i',
+        '(\nclaude --session abc\n)\nexec "${SHELL:-/bin/bash}" -i',
       ],
       expectedTmuxOptions,
     );
@@ -205,7 +205,27 @@ describe("runtime.create()", () => {
 
     const finalArg = (mockExecFileCustom.mock.calls[0][1] as string[]).at(-1)!;
     expect(finalArg).toContain("claude --session abc");
+    expect(finalArg).toMatch(/^\(\n/);
     expect(finalArg).toMatch(/exec "\$\{SHELL:-\/bin\/bash\}" -i\s*$/);
+  });
+
+  it("runs exec-based launch commands in a subshell so keep-alive still runs after agent exit", async () => {
+    const runtime = create();
+
+    mockTmuxSuccess();
+    mockTmuxSuccess();
+
+    await runtime.create({
+      sessionId: "exec-launch",
+      workspacePath: "/tmp/ws",
+      launchCommand: '[ -n "$SES_ID" ] && exec opencode --session "$SES_ID"',
+      environment: {},
+    });
+
+    const finalArg = (mockExecFileCustom.mock.calls[0][1] as string[]).at(-1)!;
+    expect(finalArg).toBe(
+      '(\n[ -n "$SES_ID" ] && exec opencode --session "$SES_ID"\n)\nexec "${SHELL:-/bin/bash}" -i',
+    );
   });
 
   it("keeps the keep-alive tail in the temp script for long launch commands", async () => {
@@ -359,7 +379,7 @@ describe("runtime.create()", () => {
       "no-env",
       "-c",
       "/tmp/ws",
-      'echo hi\nexec "${SHELL:-/bin/bash}" -i',
+      '(\necho hi\n)\nexec "${SHELL:-/bin/bash}" -i',
     ]);
   });
 });

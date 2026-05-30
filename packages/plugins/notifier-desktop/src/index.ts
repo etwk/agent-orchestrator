@@ -283,7 +283,9 @@ function dashboardSessionUrl(
   if (!dashboardUrl) return undefined;
   try {
     const base = new URL(dashboardUrl);
-    base.pathname = `/projects/${encodeURIComponent(event.projectId)}/sessions/${encodeURIComponent(event.sessionId)}`;
+    const prefix = base.pathname.replace(/\/+$/, "");
+    const sessionPath = `/projects/${encodeURIComponent(event.projectId)}/sessions/${encodeURIComponent(event.sessionId)}`;
+    base.pathname = `${prefix === "" ? "" : prefix}${sessionPath}`;
     base.search = "";
     base.hash = "";
     return base.toString();

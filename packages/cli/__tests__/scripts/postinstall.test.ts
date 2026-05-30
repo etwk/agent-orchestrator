@@ -37,8 +37,30 @@ describe("ao postinstall better-sqlite3 native binding detection", () => {
       hasBetterSqlite3Binding(packageDir, {
         ...env,
         existsSync: (candidate: string) => existingFiles.has(candidate),
+        loadNativeBinding: () => ({}),
       }),
     ).toBe(true);
+  });
+
+  it("reports an existing binding missing when it cannot load for the current ABI", () => {
+    const packageDir = "virtual-better-sqlite3";
+    const candidates = betterSqlite3BindingCandidates(packageDir, env);
+    const genericReleaseBinding = candidates.find((candidate) =>
+      candidate.endsWith("build/Release/better_sqlite3.node"),
+    );
+    if (!genericReleaseBinding) {
+      throw new Error("expected generic release binding candidate");
+    }
+
+    expect(
+      hasBetterSqlite3Binding(packageDir, {
+        ...env,
+        existsSync: (candidate: string) => candidate === genericReleaseBinding,
+        loadNativeBinding: () => {
+          throw new Error("NODE_MODULE_VERSION mismatch");
+        },
+      }),
+    ).toBe(false);
   });
 
   it("reports the binding missing when no mocked candidate exists", () => {

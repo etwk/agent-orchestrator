@@ -24,9 +24,11 @@
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, execSync } from "node:child_process";
 import { resolve, dirname } from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const requireNative = createRequire(import.meta.url);
 
 function isWindows() {
   return process.platform === "win32";
@@ -108,9 +110,20 @@ export function betterSqlite3BindingCandidates(
 
 export function hasBetterSqlite3Binding(packageDir, options = {}) {
   const fileExists = options.existsSync ?? existsSync;
+  const loadNativeBinding = options.loadNativeBinding ?? ((candidate) => requireNative(candidate));
   return betterSqlite3BindingCandidates(packageDir, options).some((candidate) =>
-    fileExists(candidate),
+    isBetterSqlite3BindingLoadable(candidate, { fileExists, loadNativeBinding }),
   );
+}
+
+function isBetterSqlite3BindingLoadable(candidate, { fileExists, loadNativeBinding }) {
+  if (!fileExists(candidate)) return false;
+  try {
+    loadNativeBinding(candidate);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function betterSqlite3RebuildCommand(packageDir, env = process.env) {

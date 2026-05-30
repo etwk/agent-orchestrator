@@ -583,10 +583,10 @@ describe("update command", () => {
         projects: { "my-app": { path: "/tmp/foo" } },
         configPath: path ?? "/cwd/agent-orchestrator.yaml",
       }));
-      mockSessions.value = [{ id: "feat-1", status: "working", projectId: "my-app" }];
+      mockSessions.value = [];
     });
 
-    it("runs stop → package install → version verification → start/restore when sessions are active", async () => {
+    it("runs stop → package install → version verification → start/restore when the daemon is running without active sessions", async () => {
       mockSpawn.mockImplementation((cmd: string, args: string[]) => {
         if (cmd === "ao" && args[0] === "--version") {
           return createMockChild(0, undefined, { stdout: "0.3.0\n" });
@@ -625,6 +625,22 @@ describe("update command", () => {
       expect(installOrder).toBeLessThan(startOrder);
     });
 
+    it("refuses before stop/install when active sessions exist", async () => {
+      mockSessions.value = [{ id: "feat-1", status: "working", projectId: "my-app" }];
+
+      await expect(program.parseAsync(["node", "test", "update"])).rejects.toThrow(
+        "process.exit(1)",
+      );
+
+      expect(mockSpawn).not.toHaveBeenCalled();
+      const stderr = vi
+        .mocked(console.error)
+        .mock.calls.map((c) => String(c[0]))
+        .join("\n");
+      expect(stderr).toContain("AO update stopped because 1 active session would be interrupted");
+      expect(stderr).toContain("feat-1");
+    });
+
     it("does not stop/start when no daemon or active sessions exist", async () => {
       mockGetRunning.mockReset();
       mockGetRunning.mockResolvedValue(null);
@@ -645,7 +661,7 @@ describe("update command", () => {
       expect(mockSpawn.mock.calls[1][1]).toEqual(["--version"]);
     });
 
-    it("cleans up orphaned active sessions without starting a daemon that was not running", async () => {
+    it("refuses orphaned active sessions without starting a daemon that was not running", async () => {
       mockGetRunning.mockReset();
       mockGetRunning.mockResolvedValue(null);
       mockExistsSync.mockReturnValue(true);
@@ -664,21 +680,11 @@ describe("update command", () => {
         return createMockChild(0, undefined, { stdout: "" });
       });
 
-      await program.parseAsync(["node", "test", "update"]);
+      await expect(program.parseAsync(["node", "test", "update"])).rejects.toThrow(
+        "process.exit(1)",
+      );
 
-      expect(mockSpawn.mock.calls[0][0]).toBe("ao");
-      expect(mockSpawn.mock.calls[0][1]).toEqual(["stop", "--yes"]);
-      expect(mockSpawn.mock.calls[0][2]).toEqual(
-        expect.objectContaining({
-          env: expect.objectContaining({ AO_CONFIG_PATH: "/tmp/test-global-config.yaml" }),
-        }),
-      );
-      expect(mockSpawn.mock.calls[1][0]).toBe("pnpm");
-      expect(mockSpawn.mock.calls[2][0]).toBe("ao");
-      expect(mockSpawn.mock.calls[2][1]).toEqual(["--version"]);
-      expect(mockSpawn.mock.calls.some((call) => call[0] === "ao" && call[1][0] === "start")).toBe(
-        false,
-      );
+      expect(mockSpawn).not.toHaveBeenCalled();
     });
 
     it("honors --no-restore when restarting after update", async () => {
@@ -1031,8 +1037,7 @@ describe("update command", () => {
       expect(mockSpawn).not.toHaveBeenCalled();
     });
 
-    it("orchestrates stop/install/verify/start when active sessions exist and update is API-invoked", async () => {
-      mockSessions.value = [{ id: "feat-1", status: "working" }];
+    it("orchestrates stop/install/verify/start when the daemon is running and update is API-invoked", async () => {
       mockExistsSync.mockReturnValue(false);
       mockGetRunning
         .mockResolvedValueOnce({

@@ -1,10 +1,11 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import chalk from "chalk";
 import { parseDocument } from "yaml";
 import {
   CONFIG_SCHEMA_URL,
   DEFAULT_DASHBOARD_NOTIFICATION_LIMIT,
   getDashboardNotificationStorePath,
+  getGlobalConfigPath,
   isCanonicalGlobalConfigPath,
   findConfigFile,
   normalizeDashboardNotificationLimit,
@@ -62,10 +63,18 @@ function stringValue(value: unknown): string | undefined {
 }
 
 function readConfigContext(): ConfigContext {
-  const configPath = findConfigFile() ?? undefined;
-  if (!configPath) {
+  const discoveredConfigPath = findConfigFile() ?? undefined;
+  if (!discoveredConfigPath) {
     throw new DashboardSetupError(
       "No agent-orchestrator.yaml found. Run 'ao start' first to create one.",
+    );
+  }
+  const configPath = isCanonicalGlobalConfigPath(discoveredConfigPath)
+    ? discoveredConfigPath
+    : getGlobalConfigPath();
+  if (!existsSync(configPath)) {
+    throw new DashboardSetupError(
+      "Dashboard notifier setup writes to the global AO config. Run 'ao start' first to register this project.",
     );
   }
 

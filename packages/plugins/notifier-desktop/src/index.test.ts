@@ -430,6 +430,17 @@ describe("notifier-desktop", () => {
       );
     });
 
+    it("preserves dashboardUrl path prefixes when building session deep links", async () => {
+      const notifier = create({ dashboardUrl: "https://example.com/ao/" });
+      await notifier.notify(makeEvent({ projectId: "my project", sessionId: "app/1" }));
+
+      const args = mockExecFile.mock.calls[0][1] as string[];
+      expect(args[args.indexOf("-open") + 1]).toBe(
+        "https://example.com/ao/projects/my%20project/sessions/app%2F1",
+      );
+    });
+
+
     it("does not pass -open when dashboardUrl is not configured", async () => {
       const notifier = create();
       await notifier.notify(makeEvent());

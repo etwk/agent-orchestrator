@@ -99,6 +99,7 @@ vi.mock("@aoagents/ao-core", () => ({
     "https://raw.githubusercontent.com/ComposioHQ/agent-orchestrator/main/schema/config.schema.json",
   DEFAULT_DASHBOARD_NOTIFICATION_LIMIT: 50,
   findConfigFile: (...args: unknown[]) => mockFindConfigFile(...args),
+  getGlobalConfigPath: () => join(homedir(), ".agent-orchestrator", "config.yaml"),
   getDashboardNotificationStorePath: (configPath: string) =>
     `${configPath}.dashboard-notifications.jsonl`,
   isCanonicalGlobalConfigPath: (configPath: string | undefined) =>
@@ -262,9 +263,13 @@ describe("setup dashboard command", () => {
     mockFindConfigFile.mockReturnValue("/tmp/agent-orchestrator.yaml");
     mockReadFileSync.mockReturnValue(MINIMAL_CONFIG);
     mockWriteFileSync.mockImplementation(() => {});
+    mockExistsSync.mockImplementation(
+      (path: string) => path === join(homedir(), ".agent-orchestrator", "config.yaml"),
+    );
   });
 
   afterEach(() => {
+    mockExistsSync.mockReset();
     vi.unstubAllGlobals();
   });
 
@@ -281,6 +286,9 @@ describe("setup dashboard command", () => {
       "75",
     ]);
 
+    expect(mockWriteFileSync.mock.calls[0][0]).toBe(
+      join(homedir(), ".agent-orchestrator", "config.yaml"),
+    );
     const written = String(mockWriteFileSync.mock.calls[0][1]);
     const parsed = parseYaml(written) as {
       notifiers?: Record<string, { plugin?: string; limit?: number }>;

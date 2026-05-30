@@ -216,25 +216,36 @@ async function getUpdateLifecyclePlan(): Promise<UpdateLifecyclePlan> {
 }
 
 async function pauseAoForUpdate(plan: UpdateLifecyclePlan): Promise<boolean> {
-  const shouldStop = plan.runningBeforeUpdate || plan.activeSessions.length > 0;
-  if (!shouldStop) return false;
-
   if (plan.activeSessions.length > 0) {
     const noun = plan.activeSessions.length === 1 ? "session" : "sessions";
-    console.log(
-      chalk.yellow(
-        `\n${plan.activeSessions.length} active ${noun} will be paused and restored after the update.`,
+    recordActivityEvent({
+      source: "cli",
+      kind: "cli.update_failed",
+      level: "error",
+      summary: `ao update refused while active sessions exist`,
+      data: {
+        activeSessionCount: plan.activeSessions.length,
+        activeSessionIds: plan.activeSessions.map((s) => s.id).slice(0, 20),
+      },
+    });
+    console.error(
+      chalk.red(
+        `\nAO update stopped because ${plan.activeSessions.length} active ${noun} would be interrupted.`,
       ),
     );
+    console.error(chalk.dim("Finish, pause, or stop these sessions before retrying `ao update`:"));
     for (const s of plan.activeSessions.slice(0, 5)) {
-      console.log(chalk.dim(`    • ${s.id}  (${s.status})`));
+      console.error(chalk.dim(`    • ${s.id}  (${s.status})`));
     }
     if (plan.activeSessions.length > 5) {
-      console.log(chalk.dim(`    … and ${plan.activeSessions.length - 5} more`));
+      console.error(chalk.dim(`    … and ${plan.activeSessions.length - 5} more`));
     }
-  } else {
-    console.log(chalk.dim("\nAO is running; it will be restarted after the update."));
+    process.exit(1);
   }
+
+  if (!plan.runningBeforeUpdate) return false;
+
+  console.log(chalk.dim("\nAO is running; it will be restarted after the update."));
 
   const stopExit = await runAoLifecycleCommand(["stop", "--yes"], {
     configPath: plan.configPath,
