@@ -202,6 +202,7 @@ export function sessionToDashboard(session: Session): DashboardSession {
     issueTitle: null, // Will be enriched by enrichSessionIssueTitle()
     userPrompt: session.metadata["userPrompt"] ?? null,
     displayName: session.metadata["displayName"] ?? null,
+    displayNameUserSet: session.metadata["displayNameUserSet"] === "true",
     summary,
     summaryIsFallback: agentSummary
       ? (session.agentInfo?.summaryIsFallback ?? false)
@@ -565,7 +566,7 @@ function prepareSessionMetadataEnrichment(
   // Agent summaries (local disk I/O — reads agent JSONL)
   const summaryPromises = coreSessions.map((core, i) => {
     if (dashboardSessions[i].summary) return Promise.resolve();
-    const agentName = projects[i]?.agent ?? config.defaults.agent;
+    const agentName = core.metadata["agent"];
     if (!agentName) return Promise.resolve();
     const agent = registry.get<Agent>("agent", agentName);
     if (!agent) return Promise.resolve();

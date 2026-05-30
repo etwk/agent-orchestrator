@@ -41,7 +41,7 @@ export default async function ProjectPage(props: { params: Promise<{ projectId: 
   const projectName = routeData.project?.name ?? routeData.projectId;
 
   return (
-    <div className="min-h-screen bg-[var(--color-bg-canvas)]">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-[var(--color-bg-canvas)]">
       <Dashboard
         initialSessions={pageData.sessions}
         projectId={routeData.projectId}

@@ -9,8 +9,8 @@
  * (or equivalent flag) at launch time — no file writing required.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve, basename, dirname } from "node:path";
 import { cwd } from "node:process";
 import chalk from "chalk";
@@ -28,9 +28,11 @@ import {
   getDefaultRuntime,
   isWindows,
   isMac,
+  isLinux,
   findPidByPort,
   killProcessTree,
   loadLocalProjectConfigDetailed,
+  recordActivityEvent,
   registerProjectInGlobalConfig,
   getGlobalConfigPath,
   type OrchestratorConfig,
@@ -38,6 +40,12 @@ import {
   type ProjectConfig,
   type ParsedRepoUrl,
   writeLocalProjectConfig,
+  spawnManagedDaemonChild,
+  sweepDaemonChildren,
+  scanAoOrphans,
+  reapAoOrphans,
+  type DaemonChildSweepResult,
+  type AoOrphanProcess,
 } from "@aoagents/ao-core";
 import { parse as yamlParse, stringify as yamlStringify } from "yaml";
 import { exec, execSilent, forwardSignalsToChild, git } from "../lib/shell.js";
@@ -80,6 +88,7 @@ import {
   type DetectedAgent,
 } from "../lib/detect-agent.js";
 import { detectDefaultBranch } from "../lib/git-utils.js";
+import { dashboardUrl } from "../lib/dashboard-url.js";
 import { promptConfirm, promptSelect, promptText } from "../lib/prompts.js";
 import { extractOwnerRepo, isValidRepoString } from "../lib/repo-utils.js";
 import {
@@ -98,9 +107,10 @@ import {
   tryInstallWithAttempts,
 } from "../lib/install-helpers.js";
 import { ensureGit, runtimePreflight } from "../lib/startup-preflight.js";
-import { installShutdownHandlers } from "../lib/shutdown.js";
+import { installShutdownHandlers, isShutdownInProgress } from "../lib/shutdown.js";
 import { resolveOrCreateProject } from "../lib/resolve-project.js";
 import { pathsEqual } from "../lib/path-equality.js";
+import { maybePromptForUpdateChannel } from "../lib/update-channel-onboarding.js";
 
 import { DEFAULT_PORT } from "../lib/constants.js";
 import { projectSessionUrl } from "../lib/routes.js";
@@ -108,6 +118,17 @@ import { projectSessionUrl } from "../lib/routes.js";
 // =============================================================================
 // HELPERS
 // =============================================================================
+
+class CliFailureEventRecordedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CliFailureEventRecordedError";
+  }
+}
+
+function isCliFailureEventRecordedError(err: unknown): boolean {
+  return err instanceof CliFailureEventRecordedError;
+}
 
 function readProjectBehaviorConfig(projectPath: string): LocalProjectConfig {
   const localConfig = loadLocalProjectConfigDetailed(projectPath);
@@ -175,6 +196,15 @@ async function registerFlatConfig(configPath: string): Promise<string | null> {
     defaultBranch,
     sessionPrefix: prefix,
     ...(repo ? { repo } : {}),
+  });
+
+  recordActivityEvent({
+    projectId: registeredProjectId,
+    source: "cli",
+    kind: "cli.config_migrated",
+    level: "info",
+    summary: `flat config registered into global config`,
+    data: { projectPath, configPath },
   });
 
   console.log(chalk.green(`  ✓ Registered "${registeredProjectId}"\n`));
@@ -334,7 +364,7 @@ function ghInstallAttempts(): InstallAttempt[] {
   if (isMac()) {
     return [{ cmd: "brew", args: ["install", "gh"], label: "brew install gh" }];
   }
-  if (!isWindows() && !isMac()) {
+  if (isLinux()) {
     return [
       {
         cmd: "sudo",
@@ -559,29 +589,11 @@ export async function autoCreateConfig(workingDir: string): Promise<Orchestrator
   const agent = await detectAgentRuntime(detectedAgents);
   console.log(chalk.green(`  ✓ Agent runtime: ${agent}`));
 
-  const port = await findFreePort(DEFAULT_PORT);
-  if (port !== null && port !== DEFAULT_PORT) {
-    console.log(chalk.yellow(`  ⚠ Port ${DEFAULT_PORT} is busy — using ${port} instead.`));
-  }
-
-  const config: Record<string, unknown> = {
-    port: port ?? DEFAULT_PORT,
-    defaults: {
-      runtime: getDefaultRuntime(),
-      agent,
-      workspace: "worktree",
-      notifiers: [],
-    },
-    projects: {
-      [projectId]: {
-        name: projectId,
-        sessionPrefix: generateSessionPrefix(projectId),
-        ...(repo ? { repo } : {}),
-        path,
-        defaultBranch,
-        ...(agentRules ? { agentRules } : {}),
-      },
-    },
+  const localConfig: LocalProjectConfig = {
+    runtime: getDefaultRuntime(),
+    agent,
+    workspace: "worktree",
+    ...(agentRules ? { agentRules } : {}),
   };
 
   const outputPath = resolve(workingDir, "agent-orchestrator.yaml");
@@ -590,8 +602,20 @@ export async function autoCreateConfig(workingDir: string): Promise<Orchestrator
     console.log(chalk.dim("  Use 'ao start' to start with the existing config.\n"));
     return loadConfig(outputPath);
   }
-  const yamlContent = configToYaml(config);
-  writeFileSync(outputPath, yamlContent);
+  writeLocalProjectConfig(workingDir, localConfig, outputPath);
+
+  try {
+    const registeredProjectId = registerProjectInGlobalConfig(projectId, projectId, path, {
+      ...(repo ? { repo } : {}),
+      defaultBranch,
+      sessionPrefix: generateSessionPrefix(projectId),
+    });
+
+    console.log(chalk.green(`✓ Registered "${registeredProjectId}" in global config\n`));
+  } catch (err) {
+    rmSync(outputPath, { force: true });
+    throw err;
+  }
 
   console.log(chalk.green(`✓ Config created: ${outputPath}\n`));
 
@@ -811,7 +835,7 @@ async function startDashboard(
   if (useDevServer) {
     // Monorepo with --dev: use pnpm run dev (tsx watch, HMR, etc.)
     console.log(chalk.dim("  Mode: development (HMR enabled)"));
-    child = spawn("pnpm", ["run", "dev"], {
+    child = spawnManagedDaemonChild("dashboard", "pnpm", ["run", "dev"], {
       cwd: webDir,
       stdio: "inherit",
       detached: !isWindows(),
@@ -824,7 +848,7 @@ async function startDashboard(
       console.log(chalk.dim("  Tip: use --dev for hot reload when editing dashboard UI\n"));
     }
     const startScript = resolve(webDir, "dist-server", "start-all.js");
-    child = spawn("node", [startScript], {
+    child = spawnManagedDaemonChild("dashboard", "node", [startScript], {
       cwd: webDir,
       stdio: "inherit",
       detached: !isWindows(),
@@ -896,9 +920,26 @@ async function runStartup(
   config: OrchestratorConfig,
   projectId: string,
   project: ProjectConfig,
-  opts?: { dashboard?: boolean; orchestrator?: boolean; rebuild?: boolean; dev?: boolean },
+  opts?: {
+    dashboard?: boolean;
+    orchestrator?: boolean;
+    rebuild?: boolean;
+    dev?: boolean;
+    /** true = restore without prompting, false = skip restore, undefined = prompt for humans */
+    restore?: boolean;
+  },
 ): Promise<number> {
   await runtimePreflight(config);
+
+  // Ask about the auto-update channel once on first `ao start` after this
+  // feature ships. No-op on subsequent runs (idempotent — guarded by the
+  // presence of `updateChannel` in the global config).
+  await maybePromptForUpdateChannel();
+
+  // Install the parent shutdown path before spawning any managed children.
+  // This guarantees a SIGINT/SIGTERM in the middle of startup still performs
+  // the full AO cleanup instead of relying on Node's default signal exit.
+  installShutdownHandlers({ configPath: config.configPath, projectId });
 
   const shouldStartLifecycle = opts?.dashboard !== false || opts?.orchestrator !== false;
   let port = config.port ?? DEFAULT_PORT;
@@ -945,7 +986,7 @@ async function runStartup(
       config.directTerminalPort,
       opts?.dev,
     );
-    spinner.succeed(`Dashboard starting on http://localhost:${port}`);
+    spinner.succeed(`Dashboard starting on ${dashboardUrl(port)}`);
     console.log(chalk.dim("  (Dashboard will be ready in a few seconds)\n"));
   }
 
@@ -970,8 +1011,19 @@ async function runStartup(
       }
     } catch (err) {
       spinner.fail("Orchestrator setup failed");
+      recordActivityEvent({
+        projectId,
+        source: "cli",
+        kind: "cli.start_failed",
+        level: "error",
+        summary: `orchestrator setup failed`,
+        data: {
+          reason: "orchestrator_setup",
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+      });
       await terminateDashboardProcessTree(dashboardProcess);
-      throw new Error(
+      throw new CliFailureEventRecordedError(
         `Failed to setup orchestrator: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
       );
@@ -981,179 +1033,231 @@ async function runStartup(
   if (shouldStartLifecycle) {
     try {
       spinner.start("Starting project supervisor");
-      await startProjectSupervisor();
+      await startProjectSupervisor({ configPath: config.configPath });
       spinner.succeed("Lifecycle project supervisor started");
     } catch (err) {
       spinner.fail("Project supervisor failed to start");
+      recordActivityEvent({
+        projectId,
+        source: "cli",
+        kind: "cli.start_failed",
+        level: "error",
+        summary: `project supervisor failed to start`,
+        data: {
+          reason: "supervisor_start",
+          errorMessage: err instanceof Error ? err.message : String(err),
+        },
+      });
       await terminateDashboardProcessTree(dashboardProcess);
-      throw new Error(
+      throw new CliFailureEventRecordedError(
         `Failed to start project supervisor: ${err instanceof Error ? err.message : String(err)}`,
         { cause: err },
       );
     }
   }
 
-  // Check for sessions from last `ao stop` and offer to restore them
-  if (isHumanCaller()) {
+  // Check for sessions from last `ao stop` and restore/prompt/skip based on caller intent.
+  if (opts?.restore !== false && (opts?.restore === true || isHumanCaller())) {
     try {
       const lastStop = await readLastStop();
-      if (lastStop) {
+      const otherProjects = lastStop?.otherProjects ?? [];
+      const stoppedSessionCount =
+        (lastStop?.sessionIds.length ?? 0) +
+        otherProjects.reduce((sum, p) => sum + p.sessionIds.length, 0);
+
+      if (lastStop && stoppedSessionCount > 0) {
         const stoppedAgo = `stopped at ${new Date(lastStop.stoppedAt).toLocaleString()}`;
-        const otherProjects = lastStop.otherProjects ?? [];
-        const stoppedSessionCount =
-          lastStop.sessionIds.length +
-          otherProjects.reduce((sum, p) => sum + p.sessionIds.length, 0);
-
-        if (stoppedSessionCount === 0) {
-          await clearLastStop();
-        } else {
-          const shouldIncludePrimarySessions =
-            lastStop.projectId === projectId || otherProjects.length > 0;
-          const currentProjectSessions = [
-            ...(lastStop.projectId === projectId ? lastStop.sessionIds : []),
-            ...otherProjects.filter((p) => p.projectId === projectId).flatMap((p) => p.sessionIds),
-          ];
-          const displayOtherProjects = otherProjects.filter((p) => p.projectId !== projectId);
-          // Build flat list of all sessions to restore, grouped for display
-          const allRestoreSessions: string[] = [
-            ...(shouldIncludePrimarySessions ? lastStop.sessionIds : []),
-            ...otherProjects.flatMap((p) => p.sessionIds),
-          ];
-
-          // Display grouped by project
-          if (currentProjectSessions.length > 0) {
-            console.log(
-              chalk.yellow(
-                `\n  ${currentProjectSessions.length} session(s) were active before last ao stop (${stoppedAgo}):`,
-              ),
-            );
-            console.log(chalk.dim(`  ${currentProjectSessions.join(", ")}\n`));
+        const shouldIncludePrimarySessions =
+          lastStop.projectId === projectId || otherProjects.length > 0;
+        const currentProjectSessions = [
+          ...(lastStop.projectId === projectId ? lastStop.sessionIds : []),
+          ...otherProjects.filter((p) => p.projectId === projectId).flatMap((p) => p.sessionIds),
+        ];
+        const displayOtherProjects = otherProjects.filter((p) => p.projectId !== projectId);
+        const allRestoreSessions: string[] = [
+          ...(shouldIncludePrimarySessions ? lastStop.sessionIds : []),
+          ...otherProjects.flatMap((p) => p.sessionIds),
+        ];
+        const restoreProjectBySessionId = new Map<string, string>();
+        for (const sessionId of lastStop.sessionIds) {
+          restoreProjectBySessionId.set(sessionId, lastStop.projectId);
+        }
+        for (const otherProject of otherProjects) {
+          for (const sessionId of otherProject.sessionIds) {
+            restoreProjectBySessionId.set(sessionId, otherProject.projectId);
           }
-          if (
-            shouldIncludePrimarySessions &&
-            lastStop.sessionIds.length > 0 &&
-            (lastStop.projectId !== projectId || currentProjectSessions.length === 0)
-          ) {
-            const label =
-              lastStop.projectId === projectId
-                ? "session(s) were active before last ao stop"
-                : `session(s) from ${lastStop.projectId} were also stopped`;
-            console.log(
-              chalk.yellow(`\n  ${lastStop.sessionIds.length} ${label} (${stoppedAgo}):`),
-            );
-            console.log(chalk.dim(`  ${lastStop.sessionIds.join(", ")}\n`));
+        }
+
+        // Display grouped by project.
+        if (currentProjectSessions.length > 0) {
+          console.log(
+            chalk.yellow(
+              `\n  ${currentProjectSessions.length} session(s) were active before last ao stop (${stoppedAgo}):`,
+            ),
+          );
+          console.log(chalk.dim(`  ${currentProjectSessions.join(", ")}\n`));
+        }
+        if (
+          shouldIncludePrimarySessions &&
+          lastStop.sessionIds.length > 0 &&
+          (lastStop.projectId !== projectId || currentProjectSessions.length === 0)
+        ) {
+          const label =
+            lastStop.projectId === projectId
+              ? "session(s) were active before last ao stop"
+              : `session(s) from ${lastStop.projectId} were also stopped`;
+          console.log(chalk.yellow(`\n  ${lastStop.sessionIds.length} ${label} (${stoppedAgo}):`));
+          console.log(chalk.dim(`  ${lastStop.sessionIds.join(", ")}\n`));
+        }
+        if (displayOtherProjects.length > 0) {
+          const otherTotal = displayOtherProjects.reduce((sum, p) => sum + p.sessionIds.length, 0);
+          console.log(
+            chalk.yellow(`  ${otherTotal} session(s) from other projects were also stopped:`),
+          );
+          for (const p of displayOtherProjects) {
+            console.log(chalk.dim(`  ${p.projectId}: ${p.sessionIds.join(", ")}`));
           }
-          if (displayOtherProjects.length > 0) {
-            const otherTotal = displayOtherProjects.reduce(
-              (sum, p) => sum + p.sessionIds.length,
-              0,
-            );
-            console.log(
-              chalk.yellow(`  ${otherTotal} session(s) from other projects were also stopped:`),
-            );
-            for (const p of displayOtherProjects) {
-              console.log(chalk.dim(`  ${p.projectId}: ${p.sessionIds.join(", ")}`));
+          console.log();
+        }
+
+        if (allRestoreSessions.length > 0) {
+          const shouldRestore =
+            opts?.restore === true ? true : await promptConfirm("Restore these sessions?", true);
+          if (shouldRestore) {
+            recordActivityEvent({
+              projectId,
+              source: "cli",
+              kind: "cli.restore_started",
+              level: "info",
+              summary: `restoring ${allRestoreSessions.length} session(s) from last-stop`,
+              data: {
+                sessionCount: allRestoreSessions.length,
+                stoppedAt: lastStop.stoppedAt,
+              },
+            });
+
+            // Use merged all-project config so the session manager can see
+            // global projects plus any local-only projects captured by stop.
+            let restoreConfig = config;
+            if (otherProjects.length > 0) {
+              const result = loadAllProjectsConfigWithFallback(config.configPath, {
+                // Interactive restore may use the foreground start config if
+                // a stale global/running config blocks the merged view. Stop
+                // and shutdown callers intentionally leave this disabled.
+                includeDefaultFallback: true,
+              });
+              restoreConfig = result.config;
+              if (result.warning) {
+                console.log(chalk.yellow(`  Warning: ${result.warning}`));
+              }
             }
-            console.log();
-          }
 
-          if (allRestoreSessions.length > 0) {
-            const shouldRestore = await promptConfirm("Restore these sessions?", true);
-            if (shouldRestore) {
-              // Use merged all-project config so the session manager can see
-              // global projects plus any local-only projects captured by stop.
-              let restoreConfig = config;
-              if (otherProjects.length > 0) {
-                const result = loadAllProjectsConfigWithFallback(config.configPath, {
-                  // Interactive restore may use the foreground start config if
-                  // a stale global/running config blocks the merged view. Stop
-                  // and shutdown callers intentionally leave this disabled.
-                  includeDefaultFallback: true,
+            const sm = await getSessionManager(restoreConfig);
+            const restoreSpinner = ora(`Restoring ${allRestoreSessions.length} session(s)`).start();
+            let restoredCount = 0;
+            const failedSessionIds = new Set<string>();
+            const warnings: string[] = [];
+            for (const sessionId of allRestoreSessions) {
+              // Skip the orchestrator — it was already restored by ensureOrchestrator above.
+              if (selectedOrchestratorId && sessionId === selectedOrchestratorId) {
+                restoredCount++;
+                continue;
+              }
+              try {
+                await sm.restore(sessionId);
+                restoredCount++;
+              } catch (err) {
+                failedSessionIds.add(sessionId);
+                const restoreProjectId = restoreProjectBySessionId.get(sessionId) ?? projectId;
+                recordActivityEvent({
+                  projectId: restoreProjectId,
+                  sessionId,
+                  source: "cli",
+                  kind: "cli.restore_session_failed",
+                  level: "warn",
+                  summary: `failed to restore session`,
+                  data: { errorMessage: err instanceof Error ? err.message : String(err) },
                 });
-                restoreConfig = result.config;
-                if (result.warning) {
-                  console.log(chalk.yellow(`  Warning: ${result.warning}`));
-                }
-              }
-              const sm = await getSessionManager(restoreConfig);
-              const restoreSpinner = ora(
-                `Restoring ${allRestoreSessions.length} session(s)`,
-              ).start();
-              let restoredCount = 0;
-              const failedSessionIds = new Set<string>();
-              const warnings: string[] = [];
-              for (const sessionId of allRestoreSessions) {
-                // Skip the orchestrator — it was already restored by ensureOrchestrator above
-                if (selectedOrchestratorId && sessionId === selectedOrchestratorId) {
-                  restoredCount++;
-                  continue;
-                }
-                try {
-                  await sm.restore(sessionId);
-                  restoredCount++;
-                } catch (err) {
-                  failedSessionIds.add(sessionId);
-                  warnings.push(
-                    `  Warning: could not restore ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
-                  );
-                }
-              }
-              if (restoredCount === allRestoreSessions.length) {
-                restoreSpinner.succeed(
-                  `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
-                );
-              } else {
-                restoreSpinner.warn(
-                  `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+                warnings.push(
+                  `  Warning: could not restore ${sessionId}: ${err instanceof Error ? err.message : String(err)}`,
                 );
               }
-              for (const w of warnings) {
-                console.log(chalk.yellow(w));
-              }
+            }
+            recordActivityEvent({
+              projectId,
+              source: "cli",
+              kind: "cli.restore_completed",
+              level: "info",
+              summary: `restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+              data: {
+                requested: allRestoreSessions.length,
+                restored: restoredCount,
+                failed: failedSessionIds.size,
+              },
+            });
+            if (restoredCount === allRestoreSessions.length) {
+              restoreSpinner.succeed(
+                `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+              );
+            } else {
+              restoreSpinner.warn(
+                `Restored ${restoredCount}/${allRestoreSessions.length} session(s)`,
+              );
+            }
+            for (const w of warnings) {
+              console.log(chalk.yellow(w));
+            }
 
-              // Preserve restore state for sessions that failed (transient
-              // workspace/runtime errors). Without this, a single failure on
-              // the first `ao start` would erase the only persisted record
-              // and the remaining sessions would never be retryable. When
-              // every session restored (or was skipped), clear the file.
-              if (failedSessionIds.size > 0) {
-                const remainingTarget = lastStop.sessionIds.filter((id) =>
-                  failedSessionIds.has(id),
+            // Preserve restore state for sessions that failed (transient
+            // workspace/runtime errors). Without this, a single failure on
+            // the first `ao start` would erase the only persisted record
+            // and the remaining sessions would never be retryable. When
+            // every session restored (or was skipped), clear the file.
+            if (failedSessionIds.size > 0) {
+              const remainingTarget = lastStop.sessionIds.filter((id) => failedSessionIds.has(id));
+              const remainingOther = otherProjects
+                .map((p) => ({
+                  projectId: p.projectId,
+                  sessionIds: p.sessionIds.filter((id) => failedSessionIds.has(id)),
+                }))
+                .filter((p) => p.sessionIds.length > 0);
+              if (remainingTarget.length > 0 || remainingOther.length > 0) {
+                await writeLastStop({
+                  stoppedAt: lastStop.stoppedAt,
+                  projectId: lastStop.projectId,
+                  sessionIds: remainingTarget,
+                  ...(remainingOther.length > 0 ? { otherProjects: remainingOther } : {}),
+                });
+                console.log(
+                  chalk.dim(
+                    `  Kept ${failedSessionIds.size} session(s) in last-stop record for retry on next ao start.\n`,
+                  ),
                 );
-                const remainingOther = otherProjects
-                  .map((p) => ({
-                    projectId: p.projectId,
-                    sessionIds: p.sessionIds.filter((id) => failedSessionIds.has(id)),
-                  }))
-                  .filter((p) => p.sessionIds.length > 0);
-                if (remainingTarget.length > 0 || remainingOther.length > 0) {
-                  await writeLastStop({
-                    stoppedAt: lastStop.stoppedAt,
-                    projectId: lastStop.projectId,
-                    sessionIds: remainingTarget,
-                    ...(remainingOther.length > 0 ? { otherProjects: remainingOther } : {}),
-                  });
-                  console.log(
-                    chalk.dim(
-                      `  Kept ${failedSessionIds.size} session(s) in last-stop record for retry on next ao start.\n`,
-                    ),
-                  );
-                } else {
-                  await clearLastStop();
-                }
               } else {
                 await clearLastStop();
               }
             } else {
-              // User declined restore — clear the record.
               await clearLastStop();
             }
           } else {
+            // User declined restore — clear the record.
             await clearLastStop();
           }
+        } else {
+          await clearLastStop();
         }
+      } else if (lastStop) {
+        await clearLastStop();
       }
     } catch (err) {
+      recordActivityEvent({
+        projectId,
+        source: "cli",
+        kind: "cli.last_stop_read_failed",
+        level: "warn",
+        summary: `failed to read or process last-stop state during startup`,
+        data: { errorMessage: err instanceof Error ? err.message : String(err) },
+      });
       // Non-fatal: don't block startup if last-stop handling fails, but keep
       // config/restore failures visible so cross-project restore gaps are diagnosable.
       console.log(
@@ -1168,7 +1272,7 @@ async function runStartup(
   console.log(chalk.bold.green("\n✓ Startup complete\n"));
 
   if (opts?.dashboard !== false) {
-    console.log(chalk.cyan("Dashboard:"), `http://localhost:${port}`);
+    console.log(chalk.cyan("Dashboard:"), dashboardUrl(port));
   }
 
   if (shouldStartLifecycle) {
@@ -1202,7 +1306,7 @@ async function runStartup(
     openAbort = new AbortController();
     const orchestratorUrl = selectedOrchestratorId
       ? projectSessionUrl(port, projectId, selectedOrchestratorId)
-      : `http://localhost:${port}`;
+      : dashboardUrl(port);
     void waitForPortAndOpen(port, orchestratorUrl, openAbort.signal);
   }
 
@@ -1233,6 +1337,7 @@ async function runStartup(
     dashboardProcess.on("exit", (code) => {
       process.removeListener("exit", killDashboardChild);
       if (openAbort) openAbort.abort();
+      if (isShutdownInProgress()) return;
       if (code !== 0 && code !== null) {
         console.error(chalk.red(`Dashboard exited with code ${code}`));
       }
@@ -1342,6 +1447,60 @@ async function stopDashboard(port: number, options?: { parentStopped?: boolean }
   console.log(chalk.yellow("Could not stop dashboard (may not be running)"));
 }
 
+function formatSweepSummary(result: DaemonChildSweepResult): string {
+  return `${result.terminated} graceful, ${result.forceKilled} force-killed${
+    result.failed > 0 ? `, ${result.failed} failed` : ""
+  }`;
+}
+
+async function sweepRegisteredDaemonChildren(ownerPid?: number): Promise<void> {
+  const result = await sweepDaemonChildren({ ownerPid });
+  if (result.attempted > 0) {
+    console.log(
+      chalk.dim(
+        `  Swept ${result.attempted} registered daemon child(ren): ${formatSweepSummary(result)}`,
+      ),
+    );
+  }
+}
+
+function describeAoOrphans(orphans: AoOrphanProcess[]): string {
+  return orphans
+    .map((orphan) => `${orphan.pid} (${orphan.role})`)
+    .slice(0, 8)
+    .join(", ");
+}
+
+async function maybeSweepAoOrphansOnStart(reapOrphans: boolean | undefined): Promise<void> {
+  const orphans = await scanAoOrphans();
+  if (orphans.length === 0) return;
+
+  if (!reapOrphans && isHumanCaller()) {
+    console.log(
+      chalk.yellow(
+        `\n  Found ${orphans.length} orphaned AO child process(es): ${describeAoOrphans(orphans)}`,
+      ),
+    );
+    reapOrphans = await promptConfirm("Kill orphaned AO child processes before starting?", true);
+  }
+
+  if (!reapOrphans) {
+    console.log(
+      chalk.yellow(
+        `  Found ${orphans.length} orphaned AO child process(es). Run \`ao start --reap-orphans\` to clean them up.`,
+      ),
+    );
+    return;
+  }
+
+  const result = await reapAoOrphans(orphans);
+  console.log(
+    chalk.green(
+      `  Reaped ${result.attempted} orphaned AO child process(es): ${formatSweepSummary(result)}`,
+    ),
+  );
+}
+
 /**
  * Spawn an orchestrator session against an already-running daemon, invalidate
  * the dashboard's project cache, and surface enough context for the user to
@@ -1406,10 +1565,10 @@ async function attachAndSpawnOrchestrator(opts: {
   }
 
   if (isHumanCaller()) {
-    console.log(chalk.dim(`  Opening dashboard: http://localhost:${daemon.port}\n`));
-    openUrl(`http://localhost:${daemon.port}`);
+    console.log(chalk.dim(`  Opening dashboard: ${dashboardUrl(daemon.port)}\n`));
+    openUrl(dashboardUrl(daemon.port));
   } else {
-    console.log(`Dashboard: http://localhost:${daemon.port}`);
+    console.log(`Dashboard: ${dashboardUrl(daemon.port)}`);
   }
 }
 
@@ -1428,6 +1587,9 @@ export function registerStart(program: Command): void {
     .option("--rebuild", "Clean and rebuild dashboard before starting")
     .option("--dev", "Use Next.js dev server with hot reload (for dashboard UI development)")
     .option("--interactive", "Prompt to configure config settings")
+    .option("--reap-orphans", "Kill orphaned AO child processes before starting")
+    .option("--restore", "Restore sessions from last ao stop without prompting")
+    .option("--no-restore", "Skip restoring sessions from last ao stop")
     .action(
       async (
         projectArg?: string,
@@ -1437,8 +1599,25 @@ export function registerStart(program: Command): void {
           rebuild?: boolean;
           dev?: boolean;
           interactive?: boolean;
+          reapOrphans?: boolean;
+          restore?: boolean;
         },
       ) => {
+        recordActivityEvent({
+          source: "cli",
+          kind: "cli.start_invoked",
+          level: "info",
+          summary: "ao start invoked",
+          data: {
+            projectArg: projectArg ?? null,
+            dashboard: opts?.dashboard !== false,
+            orchestrator: opts?.orchestrator !== false,
+            rebuild: opts?.rebuild === true,
+            dev: opts?.dev === true,
+            interactive: opts?.interactive === true,
+          },
+        });
+
         let releaseStartupLock: (() => void) | undefined;
         let startupLockReleased = false;
         const unlockStartup = (): void => {
@@ -1449,6 +1628,7 @@ export function registerStart(program: Command): void {
 
         try {
           releaseStartupLock = await acquireStartupLock();
+          await maybeSweepAoOrphansOnStart(opts?.reapOrphans);
           let config: OrchestratorConfig;
           let projectId: string;
           let project: ProjectConfig;
@@ -1473,7 +1653,7 @@ export function registerStart(program: Command): void {
               // exit. Project-id args fall through to attach+spawn so
               // automation can `ao start <id>` against a live daemon.
               console.log(`AO is already running.`);
-              console.log(`Dashboard: http://localhost:${running.port}`);
+              console.log(`Dashboard: ${dashboardUrl(running.port)}`);
               console.log(`PID: ${running.pid}`);
               console.log(`Projects: ${running.projects.join(", ")}`);
               console.log(`To restart: ao stop && ao start`);
@@ -1483,7 +1663,7 @@ export function registerStart(program: Command): void {
 
             if (isHumanCaller() && !projectArg) {
               console.log(chalk.cyan(`\nℹ AO is already running.`));
-              console.log(`  Dashboard: ${chalk.cyan(`http://localhost:${running.port}`)}`);
+              console.log(`  Dashboard: ${chalk.cyan(dashboardUrl(running.port))}`);
               console.log(`  PID: ${running.pid} | Up since: ${running.startedAt}`);
               console.log(`  Projects: ${running.projects.join(", ")}\n`);
 
@@ -1530,7 +1710,7 @@ export function registerStart(program: Command): void {
               );
 
               if (choice === "open") {
-                openUrl(`http://localhost:${running.port}`);
+                openUrl(dashboardUrl(running.port));
                 unlockStartup();
                 process.exit(0);
               } else if (choice === "quit") {
@@ -1562,7 +1742,7 @@ export function registerStart(program: Command): void {
                     ),
                   );
                 }
-                openUrl(`http://localhost:${running.port}`);
+                openUrl(dashboardUrl(running.port));
                 unlockStartup();
                 process.exit(0);
               } else if (choice === "new") {
@@ -1570,6 +1750,13 @@ export function registerStart(program: Command): void {
                 // Resolve happens below; the suffix mutation runs after.
                 startNewOrchestrator = true;
               } else if (choice === "restart") {
+                recordActivityEvent({
+                  source: "cli",
+                  kind: "cli.daemon_restart",
+                  level: "info",
+                  summary: `user chose restart, killing existing daemon`,
+                  data: { existingPid: running.pid, existingPort: running.port },
+                });
                 await killExistingDaemon(running);
                 console.log(chalk.yellow("\n  Stopped existing instance. Restarting...\n"));
                 running = null;
@@ -1641,9 +1828,9 @@ export function registerStart(program: Command): void {
               running.projects.includes(projectId)
             ) {
               console.log(chalk.cyan(`\nℹ AO is already running.`));
-              console.log(`  Dashboard: ${chalk.cyan(`http://localhost:${running.port}`)}`);
+              console.log(`  Dashboard: ${chalk.cyan(dashboardUrl(running.port))}`);
               console.log(`  Project "${projectId}" is already registered and running.\n`);
-              openUrl(`http://localhost:${running.port}`);
+              openUrl(dashboardUrl(running.port));
               unlockStartup();
               process.exit(0);
             }
@@ -1726,10 +1913,20 @@ export function registerStart(program: Command): void {
           });
 
           // Ctrl+C and `ao stop` (which sends SIGTERM) perform a full
-          // graceful shutdown: kill sessions, record last-stop state for
-          // restore, unregister, then exit. See lib/shutdown.ts.
-          installShutdownHandlers({ configPath: config.configPath, projectId });
+          // graceful shutdown via the handler installed inside runStartup().
         } catch (err) {
+          if (!isCliFailureEventRecordedError(err)) {
+            recordActivityEvent({
+              source: "cli",
+              kind: "cli.start_failed",
+              level: "error",
+              summary: `ao start action failed`,
+              data: {
+                reason: "outer",
+                errorMessage: err instanceof Error ? err.message : String(err),
+              },
+            });
+          }
           if (err instanceof Error) {
             console.error(chalk.red("\nError:"), err.message);
           } else {
@@ -1800,244 +1997,357 @@ export function registerStop(program: Command): void {
     .description("Stop orchestrator agent and dashboard")
     .option("--purge-session", "Delete mapped OpenCode session when stopping")
     .option("--all", "Stop all running AO instances")
-    .action(async (projectArg?: string, opts: { purgeSession?: boolean; all?: boolean } = {}) => {
-      try {
-        // Check running.json first
-        const running = await getRunning();
+    .option("-y, --yes", "Confirm stopping active sessions without prompting")
+    .action(
+      async (
+        projectArg?: string,
+        opts: { purgeSession?: boolean; all?: boolean; yes?: boolean } = {},
+      ) => {
+        recordActivityEvent({
+          source: "cli",
+          kind: "cli.stop_invoked",
+          level: "info",
+          summary: "ao stop invoked",
+          data: {
+            projectArg: projectArg ?? null,
+            all: opts.all === true,
+            purgeSession: opts.purgeSession === true,
+          },
+        });
+        try {
+          // Check running.json first
+          const running = await getRunning();
 
-        if (opts.all) {
-          // --all: kill via running.json if available, then fallback to config
-          if (running) {
-            // Sweep detached Windows pty-hosts BEFORE killing the parent.
-            // detached:true puts them outside the parent's process tree, so
-            // taskkill /T cannot reach them. The sweep speaks the named-pipe
-            // protocol so node-pty disposes ConPTY gracefully (avoids WER
-            // 0x800700e8). No-op on non-Windows.
-            await sweepWindowsPtyHostsBeforeParentKill();
-            // killProcessTree handles process trees on Windows (taskkill /T /F)
-            // and process groups on Unix; it swallows "already dead" internally.
-            await killProcessTree(running.pid, "SIGTERM");
-            await unregister();
-            console.log(chalk.green(`\n✓ Stopped AO on port ${running.port}`));
-            console.log(chalk.dim(`  Projects: ${running.projects.join(", ")}\n`));
+          if (opts.all) {
+            // --all: kill via running.json if available, then fallback to config
+            if (running) {
+              // Sweep detached Windows pty-hosts BEFORE killing the parent.
+              // detached:true puts them outside the parent's process tree, so
+              // taskkill /T cannot reach them. The sweep speaks the named-pipe
+              // protocol so node-pty disposes ConPTY gracefully (avoids WER
+              // 0x800700e8). No-op on non-Windows.
+              await sweepWindowsPtyHostsBeforeParentKill();
+              await sweepRegisteredDaemonChildren(running.pid);
+              // killProcessTree handles process trees on Windows (taskkill /T /F)
+              // and process groups on Unix; it swallows "already dead" internally.
+              await killProcessTree(running.pid, "SIGTERM");
+              await unregister();
+              console.log(chalk.green(`\n✓ Stopped AO on port ${running.port}`));
+              console.log(chalk.dim(`  Projects: ${running.projects.join(", ")}\n`));
+            } else {
+              console.log(chalk.yellow("No running AO instance found in running.json."));
+            }
+            return;
+          }
+
+          let config: OrchestratorConfig | null;
+          let configLoadWarning: string | undefined;
+          if (!projectArg) {
+            try {
+              const result = loadAllProjectsConfigWithFallback(running?.configPath);
+              config = result.config;
+              configLoadWarning = result.warning;
+            } catch (err) {
+              config = null;
+              configLoadWarning = `Could not load config for session cleanup: ${formatUnknownError(err)}`;
+            }
           } else {
-            console.log(chalk.yellow("No running AO instance found in running.json."));
+            config = loadConfig();
           }
-          return;
-        }
-
-        let config: OrchestratorConfig | null;
-        let configLoadWarning: string | undefined;
-        if (!projectArg) {
-          try {
-            const result = loadAllProjectsConfigWithFallback(running?.configPath);
-            config = result.config;
-            configLoadWarning = result.warning;
-          } catch (err) {
-            config = null;
-            configLoadWarning = `Could not load config for session cleanup: ${formatUnknownError(err)}`;
+          if (configLoadWarning) {
+            console.log(chalk.yellow(`  Warning: ${configLoadWarning}`));
           }
-        } else {
-          config = loadConfig();
-        }
-        if (configLoadWarning) {
-          console.log(chalk.yellow(`  Warning: ${configLoadWarning}`));
-        }
-        // When a running daemon is registered, its config is authoritative for
-        // full stops because killing that parent affects every supervised
-        // project. For targeted stops from another cwd, fall back to the
-        // global registry only if the local/running config does not contain
-        // the named project.
-        if (projectArg && config && !config.projects[projectArg]) {
-          const globalPath = getGlobalConfigPath();
-          if (existsSync(globalPath)) {
-            config = loadConfig(globalPath);
+          // When a running daemon is registered, its config is authoritative for
+          // full stops because killing that parent affects every supervised
+          // project. For targeted stops from another cwd, fall back to the
+          // global registry only if the local/running config does not contain
+          // the named project.
+          if (projectArg && config && !config.projects[projectArg]) {
+            const globalPath = getGlobalConfigPath();
+            if (existsSync(globalPath)) {
+              config = loadConfig(globalPath);
+            }
           }
-        }
-        let _projectId: string;
-        let project: ProjectConfig | null;
-        let stopTargetName: string;
-        if (!projectArg) {
-          const firstProjectId = config
-            ? Object.keys(config.projects)[0]
-            : (running?.projects[0] ?? "unknown");
-          if (config && (!firstProjectId || !config.projects[firstProjectId])) {
-            throw new Error("No projects configured. Add a project to agent-orchestrator.yaml.");
+          let _projectId: string;
+          let project: ProjectConfig | null;
+          let stopTargetName: string;
+          if (!projectArg) {
+            const firstProjectId = config
+              ? (running?.projects.find((id) => config.projects[id]) ??
+                findProjectForDirectory(config.projects, resolve(cwd())) ??
+                Object.keys(config.projects)[0])
+              : (running?.projects[0] ?? "unknown");
+            if (config && (!firstProjectId || !config.projects[firstProjectId])) {
+              throw new Error("No projects configured. Add a project to agent-orchestrator.yaml.");
+            }
+            _projectId = firstProjectId;
+            project = config?.projects[firstProjectId] ?? null;
+            stopTargetName = "all projects";
+          } else {
+            if (!config) {
+              throw new Error("No config available for targeted stop.");
+            }
+            const resolved = await resolveProject(config, projectArg, "stop");
+            _projectId = resolved.projectId;
+            project = resolved.project;
+            stopTargetName = project.name;
           }
-          _projectId = firstProjectId;
-          project = config?.projects[firstProjectId] ?? null;
-          stopTargetName = "all projects";
-        } else {
-          if (!config) {
-            throw new Error("No config available for targeted stop.");
+          const port = config?.port ?? running?.port ?? DEFAULT_PORT;
+
+          if (projectArg) {
+            console.log(chalk.bold(`\nStopping orchestrator for ${chalk.cyan(stopTargetName)}\n`));
+          } else {
+            console.log(chalk.bold(`\nStopping AO across all projects\n`));
           }
-          const resolved = await resolveProject(config, projectArg, "stop");
-          _projectId = resolved.projectId;
-          project = resolved.project;
-          stopTargetName = project.name;
-        }
-        const port = config?.port ?? running?.port ?? DEFAULT_PORT;
 
-        console.log(chalk.bold(`\nStopping orchestrator for ${chalk.cyan(stopTargetName)}\n`));
+          if (config) {
+            const sm = await getSessionManager(config);
+            try {
+              // When no explicit project is given, list ALL sessions — ao stop
+              // kills the parent process which affects all projects. When a
+              // specific project is targeted, scope to that project only.
+              const stopAll = !projectArg;
+              const rawSessions = await sm.listStored(stopAll ? undefined : _projectId);
+              // Defensive consumer-side filter. `sm.list(projectId)` already scopes
+              // to the named project, but the kill loop hard-stops processes — a
+              // contract regression here would silently kill another project's
+              // work. When a project arg is given, drop anything that isn't ours.
+              const allSessions = stopAll
+                ? rawSessions
+                : rawSessions.filter((s) => s.projectId === _projectId);
+              const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
+              const killedSessionIds: string[] = [];
 
-        if (config) {
-          const sm = await getSessionManager(config);
-          try {
-            // When no explicit project is given, list ALL sessions — ao stop
-            // kills the parent process which affects all projects. When a
-            // specific project is targeted, scope to that project only.
-            const stopAll = !projectArg;
-            const rawSessions = await sm.listStored(stopAll ? undefined : _projectId);
-            // Defensive consumer-side filter. `sm.list(projectId)` already scopes
-            // to the named project, but the kill loop hard-stops processes — a
-            // contract regression here would silently kill another project's
-            // work. When a project arg is given, drop anything that isn't ours.
-            const allSessions = stopAll
-              ? rawSessions
-              : rawSessions.filter((s) => s.projectId === _projectId);
-            const activeSessions = allSessions.filter((s) => !isTerminalSession(s));
-            const killedSessionIds: string[] = [];
+              // Separate sessions by project for display and recording.
+              const targetActive = stopAll
+                ? []
+                : activeSessions.filter((s) => s.projectId === _projectId);
+              const otherActive = stopAll
+                ? activeSessions
+                : activeSessions.filter((s) => s.projectId !== _projectId);
+              const otherByProject = new Map<string, string[]>();
 
-            // Separate sessions by project for display and recording
-            const targetActive = stopAll
-              ? []
-              : activeSessions.filter((s) => s.projectId === _projectId);
-            const otherActive = stopAll
-              ? activeSessions
-              : activeSessions.filter((s) => s.projectId !== _projectId);
-            // Group other-project sessions by projectId (used for display + recording)
-            const otherByProject = new Map<string, string[]>();
-
-            if (activeSessions.length > 0) {
-              const spinner = ora(`Stopping ${activeSessions.length} active session(s)`).start();
-              const purgeOpenCode = opts?.purgeSession === true;
-              const warnings: string[] = [];
-              for (const session of activeSessions) {
-                try {
-                  const result = await sm.kill(session.id, { purgeOpenCode });
-                  if (result.cleaned || result.alreadyTerminated) {
-                    killedSessionIds.push(session.id);
+              if (activeSessions.length > 0) {
+                if (!projectArg && opts.yes !== true && isHumanCaller()) {
+                  const confirmed = await promptConfirm(
+                    `Stop AO and ${activeSessions.length} active session(s)?`,
+                    false,
+                  );
+                  if (!confirmed) {
+                    console.log(chalk.yellow("Stop cancelled."));
+                    return;
                   }
+                }
+                const spinner = ora(`Stopping ${activeSessions.length} active session(s)`).start();
+                const purgeOpenCode = opts?.purgeSession === true;
+                const warnings: string[] = [];
+                for (const session of activeSessions) {
+                  try {
+                    const result = await sm.kill(session.id, { purgeOpenCode });
+                    if (result.cleaned || result.alreadyTerminated) {
+                      killedSessionIds.push(session.id);
+                    }
+                  } catch (err) {
+                    recordActivityEvent({
+                      projectId: session.projectId ?? _projectId,
+                      sessionId: session.id,
+                      source: "cli",
+                      kind: "cli.stop_session_failed",
+                      level: "warn",
+                      summary: `failed to kill session during ao stop`,
+                      data: { errorMessage: err instanceof Error ? err.message : String(err) },
+                    });
+                    warnings.push(
+                      `  Warning: failed to stop ${session.id}: ${err instanceof Error ? err.message : String(err)}`,
+                    );
+                  }
+                }
+                if (killedSessionIds.length === 0) {
+                  spinner.fail("Failed to stop any sessions");
+                } else if (killedSessionIds.length < activeSessions.length) {
+                  spinner.warn(
+                    `Stopped ${killedSessionIds.length}/${activeSessions.length} session(s)`,
+                  );
+                } else {
+                  spinner.succeed(`Stopped ${killedSessionIds.length} session(s)`);
+                }
+                for (const w of warnings) {
+                  console.log(chalk.yellow(w));
+                }
+
+                // Show stopped sessions grouped by project.
+                const killedTarget = targetActive
+                  .filter((s) => killedSessionIds.includes(s.id))
+                  .map((s) => s.id);
+                if (killedTarget.length > 0) {
+                  console.log(
+                    chalk.green(`  ${project?.name ?? _projectId}: ${killedTarget.join(", ")}`),
+                  );
+                }
+                for (const s of otherActive) {
+                  if (!killedSessionIds.includes(s.id)) continue;
+                  const list = otherByProject.get(s.projectId ?? "unknown") ?? [];
+                  list.push(s.id);
+                  otherByProject.set(s.projectId ?? "unknown", list);
+                }
+                for (const [pid, ids] of otherByProject) {
+                  console.log(chalk.green(`  ${pid}: ${ids.join(", ")}`));
+                }
+              } else {
+                console.log(chalk.yellow(`No active sessions found`));
+              }
+
+              // Record stopped sessions for restore on next `ao start`.
+              if (killedSessionIds.length > 0) {
+                const groupedKilledSessions = groupSessionIdsByProject(
+                  activeSessions,
+                  killedSessionIds,
+                );
+                // A full stop has no true primary project: `_projectId` is only
+                // the first configured project used to make last-stop records
+                // readable by older callers. Store every killed session under
+                // its real project so restore can reclassify the current
+                // project on display without losing cross-project scope.
+                const primarySessionIds = stopAll
+                  ? []
+                  : killedSessionIds.filter((id) => targetActive.some((s) => s.id === id));
+                const otherProjects = stopAll
+                  ? groupedKilledSessions
+                  : groupedKilledSessions.filter((entry) => entry.projectId !== _projectId);
+
+                try {
+                  await writeLastStop({
+                    stoppedAt: new Date().toISOString(),
+                    projectId: _projectId,
+                    sessionIds: primarySessionIds,
+                    otherProjects: otherProjects.length > 0 ? otherProjects : undefined,
+                  });
+                  recordActivityEvent({
+                    projectId: _projectId,
+                    source: "cli",
+                    kind: "cli.last_stop_written",
+                    level: "info",
+                    summary: `last-stop state written with ${killedSessionIds.length} session(s)`,
+                    data: {
+                      targetSessionCount: primarySessionIds.length,
+                      otherProjectCount: otherProjects.length,
+                      totalKilled: killedSessionIds.length,
+                    },
+                  });
                 } catch (err) {
-                  warnings.push(
-                    `  Warning: failed to stop ${session.id}: ${err instanceof Error ? err.message : String(err)}`,
+                  recordActivityEvent({
+                    projectId: _projectId,
+                    source: "cli",
+                    kind: "cli.last_stop_write_failed",
+                    level: "error",
+                    summary: `failed to write last-stop state during ao stop`,
+                    data: {
+                      targetSessionCount: primarySessionIds.length,
+                      otherProjectCount: otherProjects.length,
+                      totalKilled: killedSessionIds.length,
+                      errorMessage: err instanceof Error ? err.message : String(err),
+                    },
+                  });
+                  console.log(
+                    chalk.yellow(
+                      `  Could not write last-stop state: ${err instanceof Error ? err.message : String(err)}`,
+                    ),
                   );
                 }
               }
-              if (killedSessionIds.length === 0) {
-                spinner.fail("Failed to stop any sessions");
-              } else if (killedSessionIds.length < activeSessions.length) {
-                spinner.warn(
-                  `Stopped ${killedSessionIds.length}/${activeSessions.length} session(s)`,
-                );
-              } else {
-                spinner.succeed(`Stopped ${killedSessionIds.length} session(s)`);
-              }
-              for (const w of warnings) {
-                console.log(chalk.yellow(w));
-              }
-              // Show stopped sessions grouped by project
-              const killedTarget = targetActive
-                .filter((s) => killedSessionIds.includes(s.id))
-                .map((s) => s.id);
-              if (killedTarget.length > 0) {
-                console.log(
-                  chalk.green(`  ${project?.name ?? _projectId}: ${killedTarget.join(", ")}`),
-                );
-              }
-              for (const s of otherActive) {
-                if (!killedSessionIds.includes(s.id)) continue;
-                const list = otherByProject.get(s.projectId ?? "unknown") ?? [];
-                list.push(s.id);
-                otherByProject.set(s.projectId ?? "unknown", list);
-              }
-              for (const [pid, ids] of otherByProject) {
-                console.log(chalk.green(`  ${pid}: ${ids.join(", ")}`));
-              }
-            } else {
-              console.log(chalk.yellow(`No active sessions found`));
-            }
-
-            // Record stopped sessions for restore on next `ao start`
-            if (killedSessionIds.length > 0) {
-              const groupedKilledSessions = groupSessionIdsByProject(
-                activeSessions,
-                killedSessionIds,
+            } catch (err) {
+              console.log(
+                chalk.yellow(
+                  `  Could not list sessions: ${err instanceof Error ? err.message : String(err)}`,
+                ),
               );
-              // A full stop has no true primary project: `_projectId` is only
-              // the first configured project used to make last-stop records
-              // readable by older callers. Store every killed session under
-              // its real project so restore can reclassify the current
-              // project on display without losing cross-project scope.
-              const primarySessionIds = stopAll
-                ? []
-                : killedSessionIds.filter((id) => targetActive.some((s) => s.id === id));
-              const otherProjects = stopAll
-                ? groupedKilledSessions
-                : groupedKilledSessions.filter((entry) => entry.projectId !== _projectId);
-
-              await writeLastStop({
-                stoppedAt: new Date().toISOString(),
-                projectId: _projectId,
-                sessionIds: primarySessionIds,
-                otherProjects: otherProjects.length > 0 ? otherProjects : undefined,
-              });
             }
-          } catch (err) {
+          } else {
+            console.log(chalk.yellow("  Could not list sessions: no valid config available"));
+          }
+
+          // Only kill the parent `ao start` process and dashboard when stopping
+          // everything (no project arg). When targeting a specific project, the
+          // parent process and dashboard serve all projects and must stay alive.
+          if (!projectArg) {
+            // Lifecycle polling runs in-process inside the `ao start` process
+            // (registered via `running.json`). Sending SIGTERM to that PID below
+            // triggers the shared shutdown handler in `lifecycle-service`, which
+            // stops every per-project loop. No explicit stop call needed here —
+            // this CLI invocation is a separate process with an empty active map.
+            const parentStopped = Boolean(running);
+            if (running) {
+              // Sweep detached Windows pty-hosts BEFORE killing the parent.
+              // detached:true puts them outside the parent's process tree, so
+              // taskkill /T cannot reach them. The sweep speaks the named-pipe
+              // protocol so node-pty disposes ConPTY gracefully (avoids WER
+              // 0x800700e8). No-op on non-Windows.
+              await sweepWindowsPtyHostsBeforeParentKill();
+              await sweepRegisteredDaemonChildren(running.pid);
+              try {
+                await killProcessTree(running.pid, "SIGTERM");
+                recordActivityEvent({
+                  projectId: _projectId,
+                  source: "cli",
+                  kind: "cli.daemon_killed",
+                  level: "info",
+                  summary: `SIGTERM sent to parent ao start`,
+                  data: { pid: running.pid, port: running.port },
+                });
+              } catch (err) {
+                recordActivityEvent({
+                  projectId: _projectId,
+                  source: "cli",
+                  kind: "cli.daemon_killed",
+                  level: "warn",
+                  summary: `parent ao start was already dead`,
+                  data: {
+                    pid: running.pid,
+                    errorMessage: err instanceof Error ? err.message : String(err),
+                  },
+                });
+              }
+              await unregister();
+            } else {
+              await sweepRegisteredDaemonChildren();
+            }
+            await stopDashboard(running?.port ?? port, { parentStopped });
+          }
+          // Targeted stop deliberately does NOT edit `running.json` from this
+          // child CLI process. The long-lived parent supervises lifecycle
+          // workers and will remove the project from `running.projects` after
+          // it observes that the last session became terminal.
+
+          if (projectArg) {
             console.log(
-              chalk.yellow(
-                `  Could not list sessions: ${err instanceof Error ? err.message : String(err)}`,
-              ),
+              chalk.bold.green(`\n✓ Stopped sessions for ${project?.name ?? projectArg}\n`),
             );
+          } else {
+            console.log(chalk.bold.green("\n✓ Orchestrator stopped\n"));
+            console.log(chalk.dim(`  Uptime: since ${running?.startedAt ?? "unknown"}`));
+            const stoppedProjects = config
+              ? Object.keys(config.projects)
+              : (running?.projects ?? []);
+            console.log(chalk.dim(`  Projects: ${stoppedProjects.join(", ")}\n`));
           }
-        } else {
-          console.log(chalk.yellow("  Could not list sessions: no valid config available"));
-        }
-
-        // Only kill the parent `ao start` process and dashboard when stopping
-        // everything (no project arg). When targeting a specific project, the
-        // parent process and dashboard serve all projects and must stay alive.
-        if (!projectArg) {
-          // Lifecycle polling runs in-process inside the `ao start` process
-          // (registered via `running.json`). Sending SIGTERM to that PID below
-          // triggers the shared shutdown handler in `lifecycle-service`, which
-          // stops every per-project loop. No explicit stop call needed here —
-          // this CLI invocation is a separate process with an empty active map.
-          const parentStopped = Boolean(running);
-          if (running) {
-            // Sweep detached Windows pty-hosts BEFORE killing the parent.
-            // detached:true puts them outside the parent's process tree, so
-            // taskkill /T cannot reach them. The sweep speaks the named-pipe
-            // protocol so node-pty disposes ConPTY gracefully (avoids WER
-            // 0x800700e8). No-op on non-Windows.
-            await sweepWindowsPtyHostsBeforeParentKill();
-            await killProcessTree(running.pid, "SIGTERM");
-            await unregister();
+        } catch (err) {
+          recordActivityEvent({
+            source: "cli",
+            kind: "cli.stop_failed",
+            level: "error",
+            summary: `ao stop action failed`,
+            data: {
+              projectArg: projectArg ?? null,
+              errorMessage: err instanceof Error ? err.message : String(err),
+            },
+          });
+          if (err instanceof Error) {
+            console.error(chalk.red("\nError:"), err.message);
+          } else {
+            console.error(chalk.red("\nError:"), String(err));
           }
-          await stopDashboard(running?.port ?? port, { parentStopped });
+          process.exit(1);
         }
-        // Targeted stop deliberately does NOT edit `running.json` from this
-        // child CLI process. The long-lived parent supervises lifecycle
-        // workers and will remove the project from `running.projects` after
-        // it observes that the last session became terminal.
-
-        if (projectArg) {
-          console.log(
-            chalk.bold.green(`\n✓ Stopped sessions for ${project?.name ?? projectArg}\n`),
-          );
-        } else {
-          console.log(chalk.bold.green("\n✓ Orchestrator stopped\n"));
-          console.log(chalk.dim(`  Uptime: since ${running?.startedAt ?? "unknown"}`));
-          const stoppedProjects = config ? Object.keys(config.projects) : (running?.projects ?? []);
-          console.log(chalk.dim(`  Projects: ${stoppedProjects.join(", ")}\n`));
-        }
-      } catch (err) {
-        if (err instanceof Error) {
-          console.error(chalk.red("\nError:"), err.message);
-        } else {
-          console.error(chalk.red("\nError:"), String(err));
-        }
-        process.exit(1);
-      }
-    });
+      },
+    );
 }

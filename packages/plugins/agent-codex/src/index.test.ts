@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import type * as Readline from "node:readline";
 import {
   createActivitySignal,
   type Session,
@@ -21,6 +22,7 @@ const {
   mockLstat,
   mockOpen,
   mockCreateReadStream,
+  mockCreateInterface,
   mockHomedir,
   mockReadLastJsonlEntry,
   mockIsWindows,
@@ -35,6 +37,7 @@ const {
   mockLstat: vi.fn(),
   mockOpen: vi.fn(),
   mockCreateReadStream: vi.fn(),
+  mockCreateInterface: vi.fn(),
   mockHomedir: vi.fn(() => "/mock/home"),
   mockReadLastJsonlEntry: vi.fn(),
   mockIsWindows: vi.fn(() => false),
@@ -66,6 +69,17 @@ vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => false),
   createReadStream: mockCreateReadStream,
 }));
+
+vi.mock("node:readline", async (importOriginal) => {
+  const actual = await importOriginal<typeof Readline>();
+  mockCreateInterface.mockImplementation((...args: Parameters<typeof actual.createInterface>) =>
+    actual.createInterface(...args),
+  );
+  return {
+    ...actual,
+    createInterface: mockCreateInterface,
+  };
+});
 
 vi.mock("node:os", () => ({
   homedir: mockHomedir,
@@ -479,9 +493,18 @@ describe("isProcessRunning", () => {
     expect(mockExecFileAsync).not.toHaveBeenCalled();
   });
 
-  it("returns false on tmux command failure", async () => {
+  it("returns indeterminate on tmux command failure", async () => {
     mockExecFileAsync.mockRejectedValue(new Error("tmux not running"));
-    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe(false);
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe("indeterminate");
+  });
+
+  it("returns indeterminate when ps command fails", async () => {
+    mockExecFileAsync.mockImplementation((cmd: string) => {
+      if (cmd === "tmux") return Promise.resolve({ stdout: "/dev/ttys003\n", stderr: "" });
+      if (cmd === "ps") return Promise.reject(new Error("ps timed out"));
+      return Promise.reject(new Error("unexpected"));
+    });
+    expect(await agent.isProcessRunning(makeTmuxHandle())).toBe("indeterminate");
   });
 
   it("returns true when PID exists but throws EPERM", async () => {
@@ -639,11 +662,17 @@ describe("getActivityState", () => {
   });
 
   it("returns exited when process is not running", async () => {
-    mockExecFileAsync.mockRejectedValue(new Error("tmux not running"));
+    mockTmuxWithProcess("codex", false);
     const session = makeSession({ runtimeHandle: makeTmuxHandle() });
     const result = await agent.getActivityState(session);
     expect(result?.state).toBe("exited");
     expect(result?.timestamp).toBeInstanceOf(Date);
+  });
+
+  it("returns null when process probe is indeterminate", async () => {
+    mockExecFileAsync.mockRejectedValue(new Error("tmux not running"));
+    const session = makeSession({ runtimeHandle: makeTmuxHandle() });
+    await expect(agent.getActivityState(session)).resolves.toBeNull();
   });
 
   it("returns null when process is running but no workspacePath", async () => {
@@ -660,6 +689,57 @@ describe("getActivityState", () => {
       workspacePath: "/workspace/test",
     });
     expect(await agent.getActivityState(session)).toBeNull();
+  });
+
+  it("uses persisted codexThreadId filename without cwd-prefix open scans", async () => {
+    mockTmuxWithProcess("codex");
+    mockReaddir.mockResolvedValue(["rollout-2026-05-22T00-00-00-thread-fast-activity.jsonl"]);
+    const modifiedAt = new Date();
+    mockReadLastJsonlEntry.mockResolvedValue({
+      lastType: "assistant_message",
+      modifiedAt,
+    });
+
+    const session = makeSession({
+      runtimeHandle: makeTmuxHandle(),
+      workspacePath: "/workspace/test",
+      metadata: { codexThreadId: "thread-fast-activity" },
+    });
+    const result = await agent.getActivityState(session);
+
+    expect(result?.state).toBe("ready");
+    expect(mockReadLastJsonlEntry).toHaveBeenCalledWith(
+      pathJoin(
+        "/mock/home",
+        ".codex",
+        "sessions",
+        "rollout-2026-05-22T00-00-00-thread-fast-activity.jsonl",
+      ),
+    );
+    expect(mockOpen).not.toHaveBeenCalled();
+  });
+
+  it("falls back to cwd-prefix scanning when codexThreadId lookup misses", async () => {
+    mockTmuxWithProcess("codex");
+    const content = '{"type":"session_meta","cwd":"/workspace/test"}\n';
+    mockReaddir.mockResolvedValue(["rollout-other-thread.jsonl"]);
+    setupMockOpen(content);
+    mockStat.mockResolvedValue({ mtimeMs: Date.now(), mtime: new Date() });
+    mockReadLastJsonlEntry.mockResolvedValue({
+      lastType: "assistant_message",
+      modifiedAt: new Date(),
+    });
+
+    const session = makeSession({
+      runtimeHandle: makeTmuxHandle(),
+      workspacePath: "/workspace/test",
+      metadata: { codexThreadId: "missing-thread" },
+    });
+    const result = await agent.getActivityState(session);
+
+    expect(result?.state).toBe("ready");
+    expect(mockReaddir).toHaveBeenCalledTimes(1);
+    expect(mockOpen).toHaveBeenCalled();
   });
 
   it("returns active when session file was recently modified", async () => {
@@ -965,6 +1045,121 @@ describe("getSessionInfo", () => {
     expect(await agent.getSessionInfo(makeSession())).toBeNull();
   });
 
+  it("uses persisted codexThreadId filename without cwd-prefix open scans", async () => {
+    const sessionContent = jsonl(
+      {
+        type: "session_meta",
+        payload: {
+          id: "thread-fast-info",
+        },
+      },
+      {
+        type: "turn_context",
+        payload: {
+          model: "gpt-5.5",
+        },
+      },
+    );
+
+    mockReaddir.mockResolvedValue(["rollout-2026-05-22T00-00-00-thread-fast-info.jsonl"]);
+    setupMockStream(sessionContent);
+
+    const result = await agent.getSessionInfo(
+      makeSession({
+        workspacePath: "/workspace/test",
+        metadata: { codexThreadId: "thread-fast-info" },
+      }),
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.agentSessionId).toBe("rollout-2026-05-22T00-00-00-thread-fast-info");
+    expect(result!.summary).toBe("Codex session (gpt-5.5)");
+    expect(mockOpen).not.toHaveBeenCalled();
+  });
+
+  it("caches codexThreadId filename lookups by thread id", async () => {
+    const sessionContent = jsonl({
+      type: "session_meta",
+      payload: {
+        id: "thread-cached-info",
+      },
+    });
+
+    mockReaddir.mockResolvedValue(["rollout-thread-cached-info.jsonl"]);
+    mockCreateReadStream.mockImplementation(() => makeContentStream(sessionContent));
+
+    const first = await agent.getSessionInfo(
+      makeSession({
+        workspacePath: "/workspace/first",
+        metadata: { codexThreadId: "thread-cached-info" },
+      }),
+    );
+    const second = await agent.getSessionInfo(
+      makeSession({
+        workspacePath: "/workspace/second",
+        metadata: { codexThreadId: "thread-cached-info" },
+      }),
+    );
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(mockReaddir).toHaveBeenCalledTimes(1);
+    expect(mockOpen).not.toHaveBeenCalled();
+  });
+
+  it("chooses the newest duplicate codexThreadId filename match by mtime", async () => {
+    const oldContent = jsonl({
+      type: "session_meta",
+      payload: { id: "thread-dupe", model: "old-model" },
+    });
+    const newContent = jsonl({
+      type: "session_meta",
+      payload: { id: "thread-dupe", model: "new-model" },
+    });
+
+    mockReaddir.mockResolvedValue([
+      "rollout-old-thread-dupe.jsonl",
+      "rollout-new-thread-dupe.jsonl",
+    ]);
+    mockStat.mockImplementation((path: string) => {
+      if (path.includes("rollout-old-thread-dupe")) return Promise.resolve({ mtimeMs: 1000 });
+      if (path.includes("rollout-new-thread-dupe")) return Promise.resolve({ mtimeMs: 2000 });
+      return Promise.reject(new Error("ENOENT"));
+    });
+    mockCreateReadStream.mockImplementation((path: string) => {
+      if (path.includes("rollout-old-thread-dupe")) return makeContentStream(oldContent);
+      if (path.includes("rollout-new-thread-dupe")) return makeContentStream(newContent);
+      return makeContentStream("");
+    });
+
+    const result = await agent.getSessionInfo(
+      makeSession({
+        workspacePath: "/workspace/test",
+        metadata: { codexThreadId: "thread-dupe" },
+      }),
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.agentSessionId).toBe("rollout-new-thread-dupe");
+    expect(result!.summary).toBe("Codex session (new-model)");
+    expect(mockOpen).not.toHaveBeenCalled();
+  });
+
+  it("does not treat infix filename matches as thread-id hits", async () => {
+    mockReaddir.mockResolvedValue(["rollout-thread-fast-extra.jsonl"]);
+
+    const result = await agent.getSessionInfo(
+      makeSession({
+        workspacePath: null,
+        metadata: { codexThreadId: "fast" },
+      }),
+    );
+
+    expect(result).toBeNull();
+    expect(mockOpen).not.toHaveBeenCalled();
+    expect(mockCreateReadStream).not.toHaveBeenCalled();
+  });
+
   it("returns null when no session files match the workspace cwd", async () => {
     mockReaddir.mockResolvedValue(["session-abc.jsonl"]);
     const content = jsonl({ type: "session_meta", cwd: "/other/workspace", model: "gpt-4o" });
@@ -973,6 +1168,25 @@ describe("getSessionInfo", () => {
     expect(
       await agent.getSessionInfo(makeSession({ workspacePath: "/workspace/test" })),
     ).toBeNull();
+  });
+
+  it("falls back to cwd-prefix scanning when codexThreadId is absent", async () => {
+    const sessionContent = jsonl({
+      type: "session_meta",
+      cwd: "/workspace/test",
+      model: "gpt-5.4",
+    });
+
+    mockReaddir.mockResolvedValue(["rollout-cwd-fallback.jsonl"]);
+    setupMockOpen(sessionContent);
+    setupMockStream(sessionContent);
+    mockStat.mockResolvedValue({ mtimeMs: 1000 });
+
+    const result = await agent.getSessionInfo(makeSession({ workspacePath: "/workspace/test" }));
+
+    expect(result).not.toBeNull();
+    expect(result!.summary).toBe("Codex session (gpt-5.4)");
+    expect(mockOpen).toHaveBeenCalled();
   });
 
   it("returns session info with cost and model when matching session found", async () => {
@@ -1197,6 +1411,31 @@ describe("getSessionInfo", () => {
     ).toBeNull();
   });
 
+  it("closes readline and destroys the stream when JSONL streaming is interrupted", async () => {
+    const content = jsonl({ type: "session_meta", cwd: "/workspace/test" });
+    mockReaddir.mockResolvedValue(["sess.jsonl"]);
+    setupMockOpen(content);
+    mockStat.mockResolvedValue({ mtimeMs: 1000 });
+
+    const stream = makeContentStream(content);
+    const destroySpy = vi.spyOn(stream, "destroy");
+    const closeSpy = vi.fn();
+    mockCreateReadStream.mockReturnValue(stream);
+    mockCreateInterface.mockImplementationOnce(() => ({
+      close: closeSpy,
+      async *[Symbol.asyncIterator]() {
+        yield JSON.stringify({ type: "session_meta", cwd: "/workspace/test", model: "gpt-4o" });
+        throw new Error("aborted");
+      },
+    }));
+
+    expect(
+      await agent.getSessionInfo(makeSession({ workspacePath: "/workspace/test" })),
+    ).toBeNull();
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(destroySpy).toHaveBeenCalledTimes(1);
+  });
+
   it("skips session files when stat throws", async () => {
     const content = jsonl({ type: "session_meta", cwd: "/workspace/test", model: "gpt-4o" });
     mockReaddir.mockResolvedValue(["sess.jsonl"]);
@@ -1356,6 +1595,7 @@ describe("getRestoreCommand", () => {
     expect(cmd).toContain("--model 'gpt-5.3-codex'");
     expect(cmd).toContain("persisted-thread");
     expect(mockReaddir).not.toHaveBeenCalled();
+    expect(mockOpen).not.toHaveBeenCalled();
   });
 
   it("builds native resume command from payload-wrapped Codex session id", async () => {

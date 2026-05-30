@@ -54,7 +54,8 @@ describe("start-all.ts", () => {
 
   it("kills child process trees during shutdown", () => {
     expect(source).toMatch(/killProcessTree/);
-    expect(source).toMatch(/detached:\s*!isWindows\(\)/);
+    expect(source).toMatch(/spawnManagedDaemonChild/);
+    expect(source).toMatch(/detached:\s*!\s*isWindows\(\)/);
   });
 });
 
