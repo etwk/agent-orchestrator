@@ -151,12 +151,26 @@ describe("buildPrompt", () => {
       project,
       projectId: "test-app",
       issueId: "INT-1343",
+      branch: "feat/INT-1343",
     });
-    expect(systemPrompt).toContain("Work on issue #INT-1343");
+    expect(systemPrompt).toContain("Work on issue #INT-1343 on branch `feat/INT-1343`");
     expect(systemPrompt).toContain("feat/INT-1343");
     expect(taskPrompt).toContain("Work on issue #INT-1343");
     expect(taskPrompt).toContain("Issue details were not pre-fetched");
     expect(taskPrompt).toContain("gh issue view INT-1343");
+  });
+
+  it("uses the prepared branch instead of inventing a tracker branch example", () => {
+    const { systemPrompt } = buildPrompt({
+      project,
+      projectId: "test-app",
+      issueId: "#42",
+      branch: "feat/issue-42",
+    });
+
+    expect(systemPrompt).toContain("Work on issue #42 on branch `feat/issue-42`");
+    expect(systemPrompt).not.toContain("feat/42");
+    expect(systemPrompt).not.toContain("Create a branch named");
   });
 
   it("tells agent details are pre-fetched when context is provided", () => {

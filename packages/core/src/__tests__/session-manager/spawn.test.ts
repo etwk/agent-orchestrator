@@ -263,6 +263,12 @@ describe("spawn", () => {
     const session = await sm.spawn({ projectId: "my-app", issueId: "INT-100" });
     expect(session.branch).toBe("custom/INT-100-my-feature");
     expect(mockTracker.branchName).toHaveBeenCalledWith("INT-100", expect.anything());
+
+    const callArgs = vi.mocked(mockAgent.getLaunchCommand).mock.calls[0][0];
+    if (!callArgs.systemPromptFile) throw new Error("expected system prompt file");
+    const systemPrompt = readFileSync(callArgs.systemPromptFile, "utf-8");
+    expect(systemPrompt).toContain("Work on issue #INT-100 on branch `custom/INT-100-my-feature`");
+    expect(systemPrompt).not.toContain("feat/INT-100");
   });
 
   it("falls back to tracker.branchName when Issue.branchName is not git-safe", async () => {
@@ -1154,7 +1160,7 @@ describe("spawn", () => {
     expect(systemPrompt).toContain("Session Lifecycle");
     expect(systemPrompt).toContain("## Project Context");
     expect(systemPrompt).toContain("## Task");
-    expect(systemPrompt).toContain("Work on issue #INT-1343");
+    expect(systemPrompt).toContain("Work on issue #INT-1343 on branch `feat/INT-1343`");
     expect(systemPrompt).not.toContain("## Additional Instructions");
   });
 
@@ -1225,7 +1231,9 @@ describe("spawn", () => {
     expect(opencodeConfig.instructions[0]).toContain("worker-prompt-app-1.md");
 
     const systemPromptPath = opencodeConfig.instructions[0]!;
-    expect(readFileSync(systemPromptPath, "utf-8")).toContain("Work on issue #INT-1343");
+    expect(readFileSync(systemPromptPath, "utf-8")).toContain(
+      "Work on issue #INT-1343 on branch `feat/INT-1343`",
+    );
     expect(readFileSync(systemPromptPath, "utf-8")).not.toContain("## Additional Instructions");
 
     const agentsMdPath = getWorkspaceAgentsMdPath(workspacePath);
@@ -1242,7 +1250,7 @@ describe("spawn", () => {
 
     const systemPrompt = readFileSync(callArgs.systemPromptFile!, "utf-8");
     expect(systemPrompt).toContain("## Task");
-    expect(systemPrompt).toContain("Work on issue #INT-1343");
+    expect(systemPrompt).toContain("Work on issue #INT-1343 on branch `feat/INT-1343`");
   });
 
   it("installs workspace hooks before launching the agent", async () => {
