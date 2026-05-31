@@ -1760,6 +1760,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         project,
         projectId: spawnConfig.projectId,
         issueId: spawnConfig.issueId,
+        branch,
         issueContext,
         userPrompt: spawnConfig.prompt,
         ...(orchestratorExists && { orchestratorSessionId }),

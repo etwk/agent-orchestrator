@@ -45,7 +45,7 @@ Rules:
 - Use \`--note "<text>"\` to attach a short rationale when the state change is non-obvious.
 
 ## Git Workflow
-- Always create a feature branch from the default branch (never commit directly to it).
+- Use the feature branch prepared for this session. If none exists, create one from the default branch.
 - Use conventional commit messages (feat:, fix:, chore:, etc.).
 - Push your branch and create a PR when the implementation is ready.
 - Keep PRs focused — one issue per PR.
@@ -72,7 +72,7 @@ Explicit reports help the orchestrator track your state accurately. Run these fr
 Do NOT self-report \`done\` or \`terminated\` — AO owns those transitions.
 
 ## Git Workflow
-- Always create a feature branch from the default branch (never commit directly to it).
+- Use the feature branch prepared for this session. If none exists, create one from the default branch.
 - Use conventional commit messages (feat:, fix:, chore:, etc.).`;
 
 // =============================================================================
@@ -88,6 +88,9 @@ export interface PromptBuildConfig {
 
   /** Issue identifier (e.g. "INT-1343", "#42") — triggers Layer 1+2 */
   issueId?: string;
+
+  /** Feature branch selected/prepared for this session */
+  branch?: string;
 
   /** Pre-fetched issue context from tracker.generatePrompt() */
   issueContext?: string;
@@ -109,7 +112,7 @@ export interface PromptBuildConfig {
 // =============================================================================
 
 function buildConfigLayer(config: PromptBuildConfig): string {
-  const { project, projectId, issueId, issueContext } = config;
+  const { project, projectId, issueId, branch, issueContext } = config;
   const lines: string[] = [];
 
   lines.push("## Project Context");
@@ -126,9 +129,10 @@ function buildConfigLayer(config: PromptBuildConfig): string {
   if (issueId) {
     const normalizedId = issueId.replace(/^#/, "");
     lines.push(`\n## Task`);
-    lines.push(`Work on issue #${normalizedId}`);
     lines.push(
-      `Create a branch named so that it auto-links to the issue tracker (e.g. feat/${normalizedId}).`,
+      branch
+        ? `Work on issue #${normalizedId} on branch \`${branch}\`.`
+        : `Work on issue #${normalizedId}.`,
     );
   }
 
