@@ -513,8 +513,10 @@ function getDetailedAttentionLevel(session: DashboardSession): AttentionLevel {
   ) {
     return "respond";
   }
-  // Exited agent with non-terminal status = crashed, needs human attention
-  if (session.activity === ACTIVITY_STATE.EXITED) {
+  // Exited agent with non-terminal status = crashed, needs human attention.
+  // If canonical lifecycle still says the runtime is alive, treat activity-only
+  // exited as stale fallback data and let PR/lifecycle state route the card.
+  if (session.activity === ACTIVITY_STATE.EXITED && session.lifecycle?.runtimeState !== "alive") {
     return "respond";
   }
 

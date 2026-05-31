@@ -169,6 +169,36 @@ describe("getAttentionLevel", () => {
       expect(getAttentionLevel(session)).toBe("pending");
     });
 
+    it("ignores stale exited activity when live lifecycle is pending review", () => {
+      const pr = makePR({
+        reviewDecision: "pending",
+        mergeability: {
+          mergeable: false,
+          ciPassing: true,
+          approved: false,
+          noConflicts: true,
+          blockers: ["Needs review"],
+        },
+      });
+      const base = makeSession();
+      const session = makeSession({
+        status: "review_pending",
+        activity: "exited",
+        pr,
+        lifecycle: {
+          ...base.lifecycle!,
+          sessionState: "idle",
+          sessionReason: "pr_open",
+          prState: "open",
+          prReason: "review_pending",
+          runtimeState: "alive",
+        },
+      });
+
+      expect(getAttentionLevel(session)).toBe("pending");
+      expect(getAttentionLevel(session, "simple")).toBe("pending");
+    });
+
     it("returns pending when review decision is none", () => {
       const pr = makePR({
         reviewDecision: "none",
@@ -328,9 +358,9 @@ describe("getAttentionLevel", () => {
     });
 
     it("collapses stuck/errored statuses into action", () => {
-      expect(
-        getAttentionLevel(makeSession({ status: "stuck", activity: "idle" }), "simple"),
-      ).toBe("action");
+      expect(getAttentionLevel(makeSession({ status: "stuck", activity: "idle" }), "simple")).toBe(
+        "action",
+      );
       expect(
         getAttentionLevel(makeSession({ status: "errored", activity: "idle" }), "simple"),
       ).toBe("action");

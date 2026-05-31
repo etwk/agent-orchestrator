@@ -174,16 +174,18 @@ jobs:
         run: |
           version=$(node -p "require('./packages/ao/package.json').version")
           tag="v$version"
-          head_sha=$(git rev-parse HEAD)
           remote_tag_sha=$(git ls-remote --tags origin "refs/tags/$tag" | awk '{print $1}' | head -n1)
           remote_peeled_sha=$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk '{print $1}' | head -n1)
           remote_target_sha="${remote_peeled_sha:-$remote_tag_sha}"
           if [ -n "$remote_target_sha" ]; then
-            if [ "$remote_target_sha" != "$head_sha" ]; then
-              echo "::error::Tag $tag already exists at $remote_target_sha, but this snapshot is $head_sha. Refusing to reuse a mismatched release tag."
+            git fetch --force --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+            remote_tree_sha=$(git rev-parse "$tag^{tree}")
+            head_tree_sha=$(git rev-parse "HEAD^{tree}")
+            if [ "$remote_tree_sha" != "$head_tree_sha" ]; then
+              echo "::error::Tag $tag already exists, but its snapshot tree $remote_tree_sha differs from this rerun's snapshot tree $head_tree_sha. Refusing to reuse a mismatched release tag."
               exit 1
             fi
-            echo "Tag $tag already points at this snapshot — reusing it for prerelease recovery."
+            echo "Tag $tag already points at an equivalent snapshot tree — reusing it for prerelease recovery."
           else
             git tag -f "$tag"
             git push origin "refs/tags/$tag"
