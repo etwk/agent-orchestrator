@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it } from "vitest";
@@ -106,6 +106,20 @@ describe("dashboard notifications", () => {
     expect(
       readDashboardNotificationsFromFile(filePath, 50).map((record) => record.event.id),
     ).toEqual(["evt-3", "evt-4"]);
+  });
+
+  it("recovers from a stale append lock before writing", () => {
+    const filePath = makeTempPath();
+    const lockPath = `${filePath}.lock`;
+    const staleTime = new Date(Date.now() - 60_000);
+    writeFileSync(lockPath, "stale", "utf-8");
+    utimesSync(lockPath, staleTime, staleTime);
+
+    const record = createDashboardNotificationRecord(makeEvent());
+    appendDashboardNotificationRecord(filePath, record, 50);
+
+    expect(readDashboardNotificationsFromFile(filePath)).toEqual([record]);
+    expect(existsSync(lockPath)).toBe(false);
   });
 
   it("skips malformed JSONL lines", () => {

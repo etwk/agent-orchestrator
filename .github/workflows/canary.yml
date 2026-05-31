@@ -173,8 +173,21 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         run: |
           version=$(node -p "require('./packages/ao/package.json').version")
-          git tag "v$version"
-          git push origin "v$version"
+          tag="v$version"
+          head_sha=$(git rev-parse HEAD)
+          remote_tag_sha=$(git ls-remote --tags origin "refs/tags/$tag" | awk '{print $1}' | head -n1)
+          remote_peeled_sha=$(git ls-remote --tags origin "refs/tags/$tag^{}" | awk '{print $1}' | head -n1)
+          remote_target_sha="${remote_peeled_sha:-$remote_tag_sha}"
+          if [ -n "$remote_target_sha" ]; then
+            if [ "$remote_target_sha" != "$head_sha" ]; then
+              echo "::error::Tag $tag already exists at $remote_target_sha, but this snapshot is $head_sha. Refusing to reuse a mismatched release tag."
+              exit 1
+            fi
+            echo "Tag $tag already points at this snapshot — reusing it for prerelease recovery."
+          else
+            git tag -f "$tag"
+            git push origin "refs/tags/$tag"
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Public-facing GitHub prerelease. `--prerelease` flags it as such
@@ -187,6 +200,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "v${{ steps.tag.outputs.version }}" \
-            --prerelease \
-            --generate-notes
+          tag="v${{ steps.tag.outputs.version }}"
+          existing_prerelease=$(gh release view "$tag" --json isPrerelease --jq .isPrerelease 2>/dev/null || true)
+          if [ -n "$existing_prerelease" ]; then
+            if [ "$existing_prerelease" != "true" ]; then
+              echo "::error::Release $tag already exists but is not marked as a prerelease."
+              exit 1
+            fi
+            echo "Prerelease $tag already exists — reusing it for recovery."
+          else
+            gh release create "$tag" \
+              --prerelease \
+              --generate-notes
+          fi

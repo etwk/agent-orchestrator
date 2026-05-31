@@ -266,7 +266,7 @@ describe("getAttentionLevel", () => {
   });
 
   describe("restore affordances", () => {
-    it("treats exited activity as terminal even when lifecycle runtime is still alive", () => {
+    it("keeps live lifecycle state above stale exited activity", () => {
       const session = createSession({
         status: "review_pending",
         activity: "exited",
@@ -303,6 +303,14 @@ describe("getAttentionLevel", () => {
           guidance: null,
         },
       });
+
+      expect(isDashboardSessionTerminal(session)).toBe(false);
+      expect(isDashboardRuntimeEnded(session)).toBe(false);
+      expect(isDashboardSessionRestorable(session)).toBe(false);
+    });
+
+    it("uses exited activity as a terminal fallback when lifecycle is unavailable", () => {
+      const session = createSession({ activity: "exited", lifecycle: undefined });
 
       expect(isDashboardSessionTerminal(session)).toBe(true);
       expect(isDashboardRuntimeEnded(session)).toBe(true);

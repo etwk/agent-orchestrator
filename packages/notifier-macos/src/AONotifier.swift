@@ -1,10 +1,12 @@
 import AppKit
+import Darwin
 import Foundation
 import UserNotifications
 
 let appName = "AO Notifier"
 let appVersion = "0.6.0"
 let bundleId = "com.aoagents.notifier"
+let notificationCategoryLockPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("\(bundleId).categories.lock")
 
 struct NotifyPayload: Codable {
   struct Event: Codable {
@@ -190,6 +192,81 @@ func waitForDeliveredNotifications(_ center: UNUserNotificationCenter) -> [UNNot
   return resolved
 }
 
+func waitForNotificationCategories(_ center: UNUserNotificationCenter) -> Set<UNNotificationCategory>? {
+  let semaphore = DispatchSemaphore(value: 0)
+  var resolved = Set<UNNotificationCategory>()
+  center.getNotificationCategories { categories in
+    resolved = categories
+    semaphore.signal()
+  }
+  guard semaphore.wait(timeout: .now() + 5) == .success else {
+    return nil
+  }
+  return resolved
+}
+
+func withNotificationCategoryLock<T>(_ body: () throws -> T) throws -> T {
+  let fd = Darwin.open(notificationCategoryLockPath, O_CREAT | O_RDWR, 0o600)
+  if fd == -1 {
+    throw NSError(
+      domain: appName,
+      code: 3,
+      userInfo: [NSLocalizedDescriptionKey: "Could not open notification category lock"]
+    )
+  }
+  defer { _ = Darwin.close(fd) }
+
+  if flock(fd, LOCK_EX) != 0 {
+    throw NSError(
+      domain: appName,
+      code: 4,
+      userInfo: [NSLocalizedDescriptionKey: "Could not acquire notification category lock"]
+    )
+  }
+  defer { _ = flock(fd, LOCK_UN) }
+
+  return try body()
+}
+
+func stableHash(_ value: String) -> String {
+  var hash: UInt64 = 14_695_981_039_346_656_037
+  for byte in value.utf8 {
+    hash ^= UInt64(byte)
+    hash = hash &* 1_099_511_628_211
+  }
+  return String(hash, radix: 16)
+}
+
+func notificationCategoryId(for actions: [NotifyPayload.Action]) -> String {
+  let signature = actions.enumerated().compactMap { index, action -> String? in
+    guard action.url != nil || action.callbackEndpoint != nil else { return nil }
+    return [
+      String(index),
+      action.label,
+      action.url == nil ? "" : "url",
+      action.callbackEndpoint == nil ? "" : "callback",
+    ].joined(separator: "\u{1F}")
+  }.joined(separator: "\u{1E}")
+  return "ao.actions.\(stableHash(signature))"
+}
+
+func registerNotificationCategory(
+  _ category: UNNotificationCategory,
+  center: UNUserNotificationCenter
+) throws {
+  try withNotificationCategoryLock {
+    guard var categories = waitForNotificationCategories(center) else {
+      throw NSError(
+        domain: appName,
+        code: 5,
+        userInfo: [NSLocalizedDescriptionKey: "Timed out reading notification categories"]
+      )
+    }
+    categories.update(with: category)
+    center.setNotificationCategories(categories)
+  }
+}
+
 func printDeliveredNotifications() {
   let delivered = waitForDeliveredNotifications(UNUserNotificationCenter.current())
   let rows = delivered.map { notification -> [String: Any] in
@@ -249,7 +326,8 @@ func sendNotification(_ payload: NotifyPayload) throws {
 
   var actionUrls: [String: String] = [:]
   var actionCallbacks: [String: String] = [:]
-  let configuredUrlActions = (payload.actions ?? []).enumerated().compactMap { index, action -> UNNotificationAction? in
+  let payloadActions = payload.actions ?? []
+  let configuredUrlActions = payloadActions.enumerated().compactMap { index, action -> UNNotificationAction? in
     guard action.url != nil || action.callbackEndpoint != nil else { return nil }
     let identifier = "ao.action.\(index)"
     if let url = action.url {
@@ -269,14 +347,14 @@ func sendNotification(_ payload: NotifyPayload) throws {
   if configuredUrlActions.isEmpty {
     categoryId = nil
   } else {
-    let id = "ao.event.\(payload.event.id)"
+    let id = notificationCategoryId(for: payloadActions)
     let category = UNNotificationCategory(
       identifier: id,
       actions: configuredUrlActions,
       intentIdentifiers: [],
       options: []
     )
-    center.setNotificationCategories([category])
+    try registerNotificationCategory(category, center: center)
     categoryId = id
   }
 

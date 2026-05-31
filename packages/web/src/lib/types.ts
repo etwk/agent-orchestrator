@@ -418,8 +418,7 @@ export function isDashboardSessionTerminal(session: DashboardSession): boolean {
     return (
       isDashboardSessionDone(session) ||
       session.lifecycle.runtimeState === "missing" ||
-      session.lifecycle.runtimeState === "exited" ||
-      hasTerminalActivity(session)
+      session.lifecycle.runtimeState === "exited"
     );
   }
   return TERMINAL_STATUSES.has(session.status) || hasTerminalActivity(session);
@@ -428,9 +427,7 @@ export function isDashboardSessionTerminal(session: DashboardSession): boolean {
 export function isDashboardRuntimeEnded(session: DashboardSession): boolean {
   if (session.lifecycle) {
     return (
-      session.lifecycle.runtimeState === "missing" ||
-      session.lifecycle.runtimeState === "exited" ||
-      hasTerminalActivity(session)
+      session.lifecycle.runtimeState === "missing" || session.lifecycle.runtimeState === "exited"
     );
   }
   return TERMINAL_STATUSES.has(session.status) || hasTerminalActivity(session);
@@ -442,8 +439,7 @@ export function isDashboardSessionRestorable(session: DashboardSession): boolean
       session.lifecycle.sessionState === "done" ||
       isDashboardSessionTerminated(session) ||
       session.lifecycle.runtimeState === "missing" ||
-      session.lifecycle.runtimeState === "exited" ||
-      hasTerminalActivity(session);
+      session.lifecycle.runtimeState === "exited";
     return (
       terminalByCoreTruth &&
       !NON_RESTORABLE_STATUSES.has(session.status) &&
