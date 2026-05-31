@@ -1,5 +1,13 @@
 # @aoagents/ao-cli
 
+## 0.9.3
+
+### Patch Changes
+
+- Updated dependencies [700a455]
+  - @aoagents/ao-plugin-workspace-worktree@0.9.3
+  - @aoagents/ao-web@0.9.3
+
 ## 0.9.2
 
 ### Patch Changes
