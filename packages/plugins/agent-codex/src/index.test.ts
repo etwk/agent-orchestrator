@@ -602,6 +602,41 @@ describe("detectActivity", () => {
     expect(agent.detectActivity("Working on task (esc to interrupt)\nFinished.\n$ ")).toBe("idle");
   });
 
+  it("returns idle when Codex shows typed composer text and submit/newline hints", () => {
+    expect(
+      agent.detectActivity(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "Please address each finding below.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+      ),
+    ).toBe("idle");
+  });
+
+  it("returns idle when Codex composer footer wraps across lines", () => {
+    expect(
+      agent.detectActivity(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "⏎ send   Ctrl+J",
+          "newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+      ),
+    ).toBe("idle");
+  });
+
+  it("returns idle when Codex composer footer uses single-space separators", () => {
+    expect(
+      agent.detectActivity(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "⏎ send Ctrl+J newline Ctrl+T transcript Ctrl+C quit",
+        ].join("\n"),
+      ),
+    ).toBe("idle");
+  });
+
   // -- Waiting input states --
   it("returns waiting_input for approval required text", () => {
     expect(agent.detectActivity("some output\napproval required\n")).toBe("waiting_input");
@@ -645,6 +680,265 @@ describe("detectActivity", () => {
 
   it("returns active for multi-line output with activity in the middle", () => {
     expect(agent.detectActivity("Starting\n(esc to interrupt)\nstill going\n")).toBe("active");
+  });
+});
+
+// =========================================================================
+// detectInputComposer — Codex composer echo detection
+// =========================================================================
+describe("detectInputComposer", () => {
+  const agent = create();
+
+  it("detects expected staged input when composer shows the prompt and keybinding footer", () => {
+    const message = [
+      "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+      "Please address each finding below.",
+    ].join("\n");
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "Please address each finding below.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "expected_input_staged" });
+  });
+
+  it("matches later prompt lines when the first line has scrolled out of captured output", () => {
+    const message = [
+      "AO reviewer app-rev-1 found 12 open issues for PR #7.",
+      ...Array.from(
+        { length: 12 },
+        (_, index) => `Review finding ${index + 1}: address the affected code path.`,
+      ),
+      "Final required review fix: update the submit confirmation regression test.",
+    ].join("\n");
+    const output = [
+      "Review finding 11: address the affected code path.",
+      "Review finding 12: address the affected code path.",
+      "Final required review fix: update the submit confirmation regression test.",
+      "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+    ].join("\n");
+
+    expect(output).not.toContain("AO reviewer app-rev-1");
+    expect(agent.detectInputComposer?.(output, message)).toEqual({
+      state: "expected_input_staged",
+    });
+  });
+
+  it("detects expected staged input when the live composer footer wraps across lines", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "⏎ send   Ctrl+J", "newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "expected_input_staged" });
+  });
+
+  it("detects expected staged input when the footer uses single-space separators", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "⏎ send Ctrl+J newline Ctrl+T transcript Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "expected_input_staged" });
+  });
+
+  it("detects expected staged input when a textual live footer wraps across lines", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "Enter send", "Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "expected_input_staged" });
+  });
+
+  it("detects expected staged input when a textual to-send footer wraps across lines", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "Enter to send", "Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "expected_input_staged" });
+  });
+
+  it("detects visible composer separately from expected staged input", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          "Unrelated typed text from a human operator.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "visible" });
+  });
+
+  it("ignores stale composer footer when later output follows it", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          "Working on it (esc to interrupt)",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("ignores stale wrapped composer footer when later output follows it", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "⏎ send   Ctrl+J",
+          "newline   Ctrl+T transcript   Ctrl+C quit",
+          "Working on it (esc to interrupt)",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("ignores stale composer footer when later output contains footer words", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          "You can quit now after the transcript is saved.",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("ignores stale composer footer when later prose mentions enter submit", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "Enter send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          "Press Enter to submit your transcript after reading it.",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("ignores stale composer footer when later prose mentions Ctrl+C", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          "Still running; press Ctrl+C to cancel.",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("ignores stale composer footer when later output only resembles a keybinding row", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [
+          message,
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          "Status update  Ctrl+C quit",
+        ].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("rejects out-of-order footer tokens", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "Ctrl+J newline   Enter send   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("rejects wrong control key for the newline footer token", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectInputComposer?.(
+        [message, "Enter send   Ctrl+X newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "absent" });
+  });
+
+  it("does not use substring matches for non-distinctive prompts", () => {
+    expect(
+      agent.detectInputComposer?.(
+        [
+          "Unrelated composer text contains prefix for another task.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+        "fix",
+      ),
+    ).toEqual({ state: "visible" });
+  });
+
+  it("keeps multi-line non-distinctive prompt suffixes visible-only", () => {
+    const message = Array.from({ length: 12 }, () => "ok").join("\n");
+
+    expect(
+      agent.detectInputComposer?.(
+        ["ok", "ok", "ok", "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        message,
+      ),
+    ).toEqual({ state: "visible" });
+  });
+
+  it("keeps exact non-distinctive prompt matches visible-only", () => {
+    expect(
+      agent.detectInputComposer?.(
+        ["fix", "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit"].join("\n"),
+        "fix",
+      ),
+    ).toEqual({ state: "visible" });
+  });
+
+  it("returns absent when no Codex composer footer is visible", () => {
+    expect(
+      agent.detectInputComposer?.(
+        "Working on it (esc to interrupt)",
+        "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+      ),
+    ).toEqual({ state: "absent" });
   });
 });
 

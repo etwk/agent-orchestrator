@@ -39,6 +39,8 @@ export type ActivityEventKind =
   | "session.killed"
   | "session.kill_started"
   | "session.send_failed"
+  | "session.send_submit_retry"
+  | "session.send_unconfirmed"
   | "session.restore_failed"
   | "session.restore_fallback"
   | "session.rollback_started"

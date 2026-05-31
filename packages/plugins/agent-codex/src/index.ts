@@ -16,6 +16,7 @@ import {
   type ActivityState,
   type ActivityDetection,
   type CostEstimate,
+  type InputComposerDetection,
   type PluginModule,
   type ProcessProbeResult,
   type ProjectConfig,
@@ -58,6 +59,27 @@ export const manifest = {
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const SESSION_MATCH_SCAN_CHUNK_BYTES = 8192;
 const SESSION_MATCH_SCAN_LINE_LIMIT = 10;
+// Observed Codex TUI footer grammar. Keep these compatibility tokens paired
+// with real terminal-capture regressions when Codex changes its footer UI.
+// The strict order intentionally fails closed: an unrecognized footer means AO
+// skips submit-only retry rather than risking Enter on stale or unrelated text.
+const CODEX_COMPOSER_FOOTER_TEXT =
+  /^\s*(?:⏎|enter|return)\s+(?:to\s+)?(?:send|submit)\s+ctrl\s*\+?\s*j\s+(?:newline|new line)(?:\s+ctrl\s*\+?\s*t\s+transcript)?(?:\s+ctrl\s*\+?\s*c\s+quit)?\s*$/i;
+// Codex renders the keybinding footer at the bottom of the viewport. It can
+// wrap in narrow panes, so detect the final footer as a bounded live suffix.
+const CODEX_COMPOSER_FOOTER_MAX_LINES = 4;
+// Only match prompt echo text in the lines immediately above the live footer.
+// This viewport heuristic is intentionally smaller than core's confirmation
+// capture window so older scrollback is not treated as staged input.
+const CODEX_COMPOSER_REGION_LINES = 8;
+// Short/common prompts are intentionally treated as visible-only: a submit-only
+// retry is safer to skip than to fire based on non-distinctive composer text.
+const STAGED_INPUT_MIN_DISTINCTIVE_CHARS = 16;
+const STAGED_INPUT_SNIPPET_CHARS = 80;
+
+interface LiveCodexComposerRegion {
+  editableText: string;
+}
 
 interface CodexTokenUsage {
   input_tokens?: number;
@@ -93,6 +115,89 @@ interface CodexJsonlLine extends CodexJsonlPayload {
   type?: string;
   payload?: CodexJsonlPayload;
   msg?: CodexTokenUsage & { type?: string };
+}
+
+function isCodexComposerFooterText(footerText: string): boolean {
+  return CODEX_COMPOSER_FOOTER_TEXT.test(footerText);
+}
+
+function getLiveCodexComposerRegion(terminalOutput: string): LiveCodexComposerRegion | null {
+  const lines = terminalOutput.split(/\r?\n/);
+  let lastContentIndex = lines.length - 1;
+
+  while (lastContentIndex >= 0 && (lines[lastContentIndex] ?? "").trim().length === 0) {
+    lastContentIndex--;
+  }
+
+  if (lastContentIndex < 0) return null;
+
+  const earliestFooterStart = Math.max(0, lastContentIndex - CODEX_COMPOSER_FOOTER_MAX_LINES + 1);
+  for (let footerStart = lastContentIndex; footerStart >= earliestFooterStart; footerStart--) {
+    const footerText = lines.slice(footerStart, lastContentIndex + 1).join("\n");
+    if (!isCodexComposerFooterText(footerText)) continue;
+
+    const startIndex = Math.max(0, footerStart - CODEX_COMPOSER_REGION_LINES);
+    return {
+      editableText: lines.slice(startIndex, footerStart).join("\n"),
+    };
+  }
+
+  return null;
+}
+
+function normalizeComposerEchoText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function addUniqueSnippet(snippets: string[], snippet: string): void {
+  const normalized = normalizeComposerEchoText(snippet);
+  if (normalized && !snippets.includes(normalized)) {
+    snippets.push(normalized);
+  }
+}
+
+function promptEchoSnippets(expectedInput: string): string[] {
+  const lines = expectedInput
+    .split(/\r?\n/)
+    .map((line) => normalizeComposerEchoText(line))
+    .filter((line) => line.length > 0);
+  const snippets: string[] = [];
+
+  for (const line of lines) {
+    if (line.length <= STAGED_INPUT_SNIPPET_CHARS) {
+      addUniqueSnippet(snippets, line);
+      continue;
+    }
+
+    addUniqueSnippet(snippets, line.slice(0, STAGED_INPUT_SNIPPET_CHARS));
+    const middleStart = Math.max(0, Math.floor((line.length - STAGED_INPUT_SNIPPET_CHARS) / 2));
+    addUniqueSnippet(snippets, line.slice(middleStart, middleStart + STAGED_INPUT_SNIPPET_CHARS));
+    addUniqueSnippet(snippets, line.slice(-STAGED_INPUT_SNIPPET_CHARS));
+  }
+
+  return snippets;
+}
+
+function detectCodexInputComposer(
+  terminalOutput: string,
+  expectedInput: string,
+): InputComposerDetection {
+  const liveComposer = getLiveCodexComposerRegion(terminalOutput);
+  if (!liveComposer) return { state: "absent" };
+
+  const normalizedEditableText = normalizeComposerEchoText(liveComposer.editableText);
+  const snippets = promptEchoSnippets(expectedInput);
+  const distinctiveSnippets = snippets.filter(
+    (snippet) => snippet.length >= STAGED_INPUT_MIN_DISTINCTIVE_CHARS,
+  );
+
+  if (distinctiveSnippets.length > 0) {
+    return distinctiveSnippets.some((snippet) => normalizedEditableText.includes(snippet))
+      ? { state: "expected_input_staged" }
+      : { state: "visible" };
+  }
+
+  return { state: "visible" };
 }
 
 function getCodexPayload(entry: CodexJsonlLine): CodexJsonlPayload {
@@ -658,9 +763,19 @@ function createCodexAgent(): Agent {
       if (/approval required/i.test(tail)) return "waiting_input";
       if (/\(y\)es.*\(n\)o/i.test(tail)) return "waiting_input";
 
+      // Codex's idle composer can include already-typed text plus its keybinding
+      // footer (for example: "⏎ send Ctrl+J newline ..."). Treat that as idle,
+      // not active work, so AO does not mistake an unsubmitted pasted prompt for
+      // successful delivery.
+      if (getLiveCodexComposerRegion(tail)) return "idle";
+
       // Default to active — specific patterns (esc to interrupt, spinner
       // symbols) all map to "active" so no need to check them individually.
       return "active";
+    },
+
+    detectInputComposer(terminalOutput: string, expectedInput: string): InputComposerDetection {
+      return detectCodexInputComposer(terminalOutput, expectedInput);
     },
 
     async getActivityState(

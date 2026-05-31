@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import chalk from "chalk";
 import type { Command } from "commander";
 import {
@@ -12,6 +13,9 @@ import {
 import { exec, tmux } from "../lib/shell.js";
 import { getAgentByName, getAgentByNameFromRegistry } from "../lib/plugins.js";
 import { getPluginRegistry, getSessionManager } from "../lib/create-session-manager.js";
+
+const SHORT_MESSAGE_SETTLE_MS = 300;
+const BUFFER_PASTE_SETTLE_MS = 1_000;
 
 /**
  * Resolve session context: tmux target name and Agent plugin.
@@ -91,23 +95,29 @@ async function sendViaTmux(tmuxTarget: string, message: string): Promise<void> {
   await sleep(200);
 
   if (message.includes("\n") || message.length > 200) {
-    const tmpFile = join(tmpdir(), `ao-send-${Date.now()}.txt`);
-    writeFileSync(tmpFile, message);
+    const bufferName = `ao-${randomUUID()}`;
+    const tmpFile = join(tmpdir(), `ao-send-${randomUUID()}.txt`);
+    writeFileSync(tmpFile, message, { encoding: "utf-8", mode: 0o600 });
     try {
-      await exec("tmux", ["load-buffer", tmpFile]);
-      await exec("tmux", ["paste-buffer", "-t", tmuxTarget]);
+      await exec("tmux", ["load-buffer", "-b", bufferName, tmpFile]);
+      await exec("tmux", ["paste-buffer", "-p", "-r", "-b", bufferName, "-t", tmuxTarget, "-d"]);
     } finally {
       try {
         unlinkSync(tmpFile);
       } catch {
         // ignore cleanup failure
       }
+      await exec("tmux", ["delete-buffer", "-b", bufferName]).catch(() => {});
     }
   } else {
     await exec("tmux", ["send-keys", "-t", tmuxTarget, "-l", message]);
   }
 
-  await sleep(300);
+  await sleep(
+    message.includes("\n") || message.length > 200
+      ? BUFFER_PASTE_SETTLE_MS
+      : SHORT_MESSAGE_SETTLE_MS,
+  );
   await exec("tmux", ["send-keys", "-t", tmuxTarget, "Enter"]);
 }
 
@@ -143,9 +153,7 @@ export function registerSend(program: Command): void {
         // way to identify who's writing. Humans running ao send from their
         // own terminal have no AO_SESSION_ID and stay unprefixed.
         const senderSessionId = process.env["AO_SESSION_ID"];
-        const message = senderSessionId
-          ? `[from ${senderSessionId}] ${rawMessage}`
-          : rawMessage;
+        const message = senderSessionId ? `[from ${senderSessionId}] ${rawMessage}` : rawMessage;
 
         const parsedTimeout = parseInt(opts.timeout || "600", 10);
         const timeoutMs = (isNaN(parsedTimeout) || parsedTimeout <= 0 ? 600 : parsedTimeout) * 1000;

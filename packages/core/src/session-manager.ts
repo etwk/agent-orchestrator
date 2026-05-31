@@ -3528,6 +3528,9 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       await runtimePlugin.sendMessage(handle, message);
 
+      let composerSeen = false;
+      let submitRetrySent = false;
+      let submitRetryError: string | undefined;
       for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
         // Sleep before each check (including the first) so the runtime has time
         // to reflect the message in its output.
@@ -3536,17 +3539,48 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         const output = await captureOutput(handle);
         const activity = detectActivityFromOutput(output) ?? session.activity;
         const updatedAt = await getOpenCodeSessionUpdatedAt();
+        const composerDetection = agentPlugin.detectInputComposer?.(output, message);
+        const composerState = composerDetection?.state ?? "absent";
+        const composerVisible = composerState !== "absent";
+        const expectedInputStaged = composerState === "expected_input_staged";
+        composerSeen ||= composerVisible;
         const delivered =
           (baselineUpdatedAt !== undefined &&
             updatedAt !== undefined &&
             updatedAt > baselineUpdatedAt) ||
           hasQueuedMessage(output) ||
-          (output.length > 0 && output !== baselineOutput) ||
-          (baselineActivity !== "active" && activity === "active") ||
-          (baselineActivity !== "waiting_input" && activity === "waiting_input");
+          (!composerVisible && output.length > 0 && output !== baselineOutput) ||
+          (!composerVisible && baselineActivity !== "active" && activity === "active") ||
+          (!composerVisible &&
+            baselineActivity !== "waiting_input" &&
+            activity === "waiting_input");
 
         if (delivered) {
           return;
+        }
+
+        if (expectedInputStaged && !submitRetrySent && runtimePlugin.submitInput) {
+          submitRetrySent = true;
+          recordActivityEvent({
+            projectId,
+            sessionId,
+            source: "session-manager",
+            kind: "session.send_submit_retry",
+            level: "info",
+            summary: `submit-only retry after staged input detection: ${sessionId}`,
+            data: {
+              agent: agentName,
+              runtime: runtimeName,
+              composerState,
+            },
+          });
+          try {
+            await runtimePlugin.submitInput(handle);
+          } catch (err) {
+            submitRetryError = err instanceof Error ? err.message : String(err);
+            // Keep the existing soft-success behavior if the targeted submit
+            // retry cannot run; the original send already happened.
+          }
         }
       }
 
@@ -3555,6 +3589,22 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
       // as a soft success rather than throwing.  Throwing here caused the caller
       // to report failure, which prevented the dispatch-hash from updating and
       // led to duplicate messages on the next poll cycle.
+      if (composerSeen) {
+        recordActivityEvent({
+          projectId,
+          sessionId,
+          source: "session-manager",
+          kind: "session.send_unconfirmed",
+          level: "warn",
+          summary: `send unconfirmed after staged input detection: ${sessionId}`,
+          data: {
+            agent: agentName,
+            runtime: runtimeName,
+            submitRetrySent,
+            submitRetryError,
+          },
+        });
+      }
       return;
     };
 

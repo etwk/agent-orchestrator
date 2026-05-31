@@ -6,6 +6,9 @@
 
 import { execFile } from "node:child_process";
 
+const SHORT_MESSAGE_SETTLE_MS = 300;
+const BUFFER_PASTE_SETTLE_MS = 1_000;
+
 /** Run a tmux command and return stdout. */
 function tmux(...args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -104,7 +107,10 @@ export async function sendKeys(
 
     try {
       await tmux("load-buffer", "-b", bufferName, tmpFile);
-      await tmux("paste-buffer", "-b", bufferName, "-d", "-t", sessionName);
+      // Preserve raw LF and bracketed-paste semantics for TUIs such as Codex.
+      // tmux otherwise rewrites LF to CR, which can become accidental submits
+      // instead of multiline prompt text.
+      await tmux("paste-buffer", "-p", "-r", "-b", bufferName, "-d", "-t", sessionName);
     } finally {
       try {
         unlinkSync(tmpFile);
@@ -122,9 +128,12 @@ export async function sendKeys(
     // Delay for paste to complete before sending Enter
     // Higher delay needed when using paste-buffer to ensure tmux processes the paste
     // before receiving the Enter keystroke (especially with Claude permission prompts)
-    if (text.includes("\n") || text.length > 200) {
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
+    await new Promise((resolve) =>
+      setTimeout(
+        resolve,
+        text.includes("\n") || text.length > 200 ? BUFFER_PASTE_SETTLE_MS : SHORT_MESSAGE_SETTLE_MS,
+      ),
+    );
     await tmux("send-keys", "-t", sessionName, "Enter");
   }
 }

@@ -258,15 +258,7 @@ describe("runtime.create()", () => {
     expect(mockExecFileCustom).toHaveBeenNthCalledWith(
       1,
       "tmux",
-      [
-        "new-session",
-        "-d",
-        "-s",
-        "launch-long",
-        "-c",
-        "/tmp/ws",
-        expect.stringContaining("bash "),
-      ],
+      ["new-session", "-d", "-s", "launch-long", "-c", "/tmp/ws", expect.stringContaining("bash ")],
       expectedTmuxOptions,
     );
   });
@@ -450,7 +442,7 @@ describe("runtime.sendMessage()", () => {
     );
   });
 
-  it("uses load-buffer + paste-buffer for long text (> 200 chars)", async () => {
+  it("uses raw bracketed paste for long text (> 200 chars)", async () => {
     const runtime = create();
     const handle = makeHandle("msg-long");
     const longText = "x".repeat(250);
@@ -487,11 +479,12 @@ describe("runtime.sendMessage()", () => {
       expectedTmuxOptions,
     );
 
-    // Call 2: paste-buffer
+    // Call 2: paste-buffer. -p preserves Codex/agent bracketed-paste
+    // semantics and -r prevents tmux from rewriting LF into CR/Enter.
     expect(mockExecFileCustom).toHaveBeenNthCalledWith(
       3,
       "tmux",
-      ["paste-buffer", "-b", "ao-test-uuid-1234", "-t", "msg-long", "-d"],
+      ["paste-buffer", "-p", "-r", "-b", "ao-test-uuid-1234", "-t", "msg-long", "-d"],
       expectedTmuxOptions,
     );
 
@@ -564,6 +557,24 @@ describe("runtime.sendMessage()", () => {
     expect(mockExecFileCustom).toHaveBeenCalledWith(
       "tmux",
       ["delete-buffer", "-b", "ao-test-uuid-1234"],
+      expectedTmuxOptions,
+    );
+  });
+});
+
+describe("runtime.submitInput()", () => {
+  it("presses Enter without clearing or writing input", async () => {
+    const runtime = create();
+    const handle = makeHandle("submit-only");
+
+    mockTmuxSuccess();
+
+    await runtime.submitInput?.(handle);
+
+    expect(mockExecFileCustom).toHaveBeenCalledTimes(1);
+    expect(mockExecFileCustom).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "submit-only", "Enter"],
       expectedTmuxOptions,
     );
   });
