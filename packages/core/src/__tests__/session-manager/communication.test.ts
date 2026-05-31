@@ -199,9 +199,12 @@ describe("send", () => {
       .mockReturnValueOnce("idle")
       .mockReturnValueOnce("active")
       .mockReturnValueOnce("active");
-    const detectStagedInput = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
-    (mockAgent as Agent & { detectStagedInput: typeof detectStagedInput }).detectStagedInput =
-      detectStagedInput;
+    const detectInputComposer = vi
+      .fn()
+      .mockReturnValueOnce({ state: "expected_input_staged" as const })
+      .mockReturnValue({ state: "absent" as const });
+    (mockAgent as Agent & { detectInputComposer: typeof detectInputComposer }).detectInputComposer =
+      detectInputComposer;
     const submitInput = vi.fn().mockResolvedValue(undefined);
     (mockRuntime as Runtime & { submitInput: typeof submitInput }).submitInput = submitInput;
 
@@ -209,9 +212,57 @@ describe("send", () => {
     await sm.send("app-1", message);
 
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(handle, message);
-    expect(detectStagedInput).toHaveBeenCalledWith(expect.stringContaining("⏎ send"), message);
+    expect(detectInputComposer).toHaveBeenCalledWith(expect.stringContaining("⏎ send"), message);
     expect(submitInput).toHaveBeenCalledWith(handle);
     expect(submitInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not confirm delivery from terminal echo while a Codex composer is visible", async () => {
+    vi.useFakeTimers();
+    try {
+      const handle = makeHandle("rt-1");
+      const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+      writeMetadata(sessionsDir, "app-1", {
+        worktree: "/tmp",
+        branch: "main",
+        status: "working",
+        project: "my-app",
+        agent: "codex",
+        runtimeHandle: handle,
+      });
+      vi.mocked(mockRuntime.getOutput)
+        .mockResolvedValueOnce("> ")
+        .mockResolvedValue(
+          [
+            "Unrelated staged text from a human operator.",
+            "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+          ].join("\n"),
+        );
+      vi.mocked(mockAgent.detectActivity).mockReturnValue("active");
+      const detectInputComposer = vi.fn().mockReturnValue({ state: "visible" as const });
+      (
+        mockAgent as Agent & { detectInputComposer: typeof detectInputComposer }
+      ).detectInputComposer = detectInputComposer;
+      const submitInput = vi.fn().mockResolvedValue(undefined);
+      (mockRuntime as Runtime & { submitInput: typeof submitInput }).submitInput = submitInput;
+
+      const sm = createSessionManager({ config, registry: mockRegistry });
+      const sendPromise = sm.send("app-1", message);
+      const resolved = vi.fn();
+      sendPromise.then(resolved);
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(resolved).not.toHaveBeenCalled();
+
+      await vi.runAllTimersAsync();
+      await sendPromise;
+
+      expect(detectInputComposer).toHaveBeenCalledTimes(6);
+      expect(submitInput).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("resolves on restored session when confirmation never flips (soft success)", async () => {

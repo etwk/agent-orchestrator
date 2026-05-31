@@ -661,19 +661,19 @@ describe("detectActivity", () => {
 });
 
 // =========================================================================
-// detectStagedInput — Codex composer echo detection
+// detectInputComposer — Codex composer echo detection
 // =========================================================================
-describe("detectStagedInput", () => {
+describe("detectInputComposer", () => {
   const agent = create();
 
-  it("returns true when Codex composer shows the expected prompt and keybinding footer", () => {
+  it("detects expected staged input when composer shows the prompt and keybinding footer", () => {
     const message = [
       "AO reviewer app-rev-1 found 2 open issues for PR #7.",
       "Please address each finding below.",
     ].join("\n");
 
     expect(
-      agent.detectStagedInput?.(
+      agent.detectInputComposer?.(
         [
           "AO reviewer app-rev-1 found 2 open issues for PR #7.",
           "Please address each finding below.",
@@ -681,7 +681,7 @@ describe("detectStagedInput", () => {
         ].join("\n"),
         message,
       ),
-    ).toBe(true);
+    ).toEqual({ state: "expected_input_staged" });
   });
 
   it("matches later prompt lines when the first line has scrolled out of captured output", () => {
@@ -701,21 +701,32 @@ describe("detectStagedInput", () => {
     ].join("\n");
 
     expect(output).not.toContain("AO reviewer app-rev-1");
-    expect(agent.detectStagedInput?.(output, message)).toBe(true);
+    expect(agent.detectInputComposer?.(output, message)).toEqual({
+      state: "expected_input_staged",
+    });
   });
 
-  it("returns false when the composer footer is present without expected prompt content", () => {
+  it("detects visible composer separately from expected staged input", () => {
     const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
 
     expect(
-      agent.detectStagedInput?.(
+      agent.detectInputComposer?.(
         [
           "Unrelated typed text from a human operator.",
           "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
         ].join("\n"),
         message,
       ),
-    ).toBe(false);
+    ).toEqual({ state: "visible" });
+  });
+
+  it("returns absent when no Codex composer footer is visible", () => {
+    expect(
+      agent.detectInputComposer?.(
+        "Working on it (esc to interrupt)",
+        "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+      ),
+    ).toEqual({ state: "absent" });
   });
 });
 

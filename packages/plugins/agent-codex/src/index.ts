@@ -16,6 +16,7 @@ import {
   type ActivityState,
   type ActivityDetection,
   type CostEstimate,
+  type InputComposerDetection,
   type PluginModule,
   type ProcessProbeResult,
   type ProjectConfig,
@@ -145,12 +146,12 @@ function promptEchoSnippets(expectedInput: string): string[] {
   return snippets;
 }
 
-function isExpectedInputEchoedInCodexComposer(
+function detectCodexInputComposer(
   terminalOutput: string,
   expectedInput: string,
-): boolean {
+): InputComposerDetection {
   const tail = terminalOutput.split("\n").slice(-20).join("\n");
-  if (!hasCodexComposerFooter(tail)) return false;
+  if (!hasCodexComposerFooter(tail)) return { state: "absent" };
 
   const normalizedTail = normalizeComposerEchoText(tail);
   const snippets = promptEchoSnippets(expectedInput);
@@ -159,10 +160,14 @@ function isExpectedInputEchoedInCodexComposer(
   );
 
   if (distinctiveSnippets.length > 0) {
-    return distinctiveSnippets.some((snippet) => normalizedTail.includes(snippet));
+    return distinctiveSnippets.some((snippet) => normalizedTail.includes(snippet))
+      ? { state: "expected_input_staged" }
+      : { state: "visible" };
   }
 
-  return snippets.some((snippet) => normalizedTail.includes(snippet));
+  return snippets.some((snippet) => normalizedTail.includes(snippet))
+    ? { state: "expected_input_staged" }
+    : { state: "visible" };
 }
 
 function getCodexPayload(entry: CodexJsonlLine): CodexJsonlPayload {
@@ -739,8 +744,8 @@ function createCodexAgent(): Agent {
       return "active";
     },
 
-    detectStagedInput(terminalOutput: string, expectedInput: string): boolean {
-      return isExpectedInputEchoedInCodexComposer(terminalOutput, expectedInput);
+    detectInputComposer(terminalOutput: string, expectedInput: string): InputComposerDetection {
+      return detectCodexInputComposer(terminalOutput, expectedInput);
     },
 
     async getActivityState(

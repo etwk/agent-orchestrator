@@ -400,7 +400,8 @@ export interface Runtime {
    * Optional: submit whatever is already staged in the runtime input area
    * without modifying it. Runtimes with terminal semantics can use this for a
    * targeted retry when a prior long paste reached the composer but the final
-   * submit keypress was not observed by the agent.
+   * submit keypress was not observed by the agent. Callers must invoke this only
+   * after agent-owned detection reports that the expected input is staged.
    */
   submitInput?(handle: RuntimeHandle): Promise<void>;
 
@@ -475,6 +476,19 @@ export function isProcessProbeIndeterminate(
   return result === PROCESS_PROBE_INDETERMINATE;
 }
 
+export type InputComposerState = "absent" | "visible" | "expected_input_staged";
+
+export interface InputComposerDetection {
+  /**
+   * absent: no input composer is visible.
+   * visible: an input composer is visible, but the expected input was not
+   * confidently matched.
+   * expected_input_staged: the expected input appears to still be staged in the
+   * composer and is safe for a submit-only retry.
+   */
+  state: InputComposerState;
+}
+
 export interface Agent {
   readonly name: string;
 
@@ -501,12 +515,12 @@ export interface Agent {
   detectActivity(terminalOutput: string): ActivityState;
 
   /**
-   * Optional: conservatively detect that terminal output shows the expected
-   * input still staged in the agent's composer, not submitted. Session delivery
-   * confirmation uses this only for targeted submit-only retries; implementations
-   * must return false when the composer echo is uncertain.
+   * Optional: detect whether terminal output shows the agent's input composer.
+   * Session delivery confirmation suppresses terminal-echo delivery heuristics
+   * while a composer is visible, and invokes submit-only retries only when the
+   * agent reports `expected_input_staged`.
    */
-  detectStagedInput?(terminalOutput: string, expectedInput: string): boolean;
+  detectInputComposer?(terminalOutput: string, expectedInput: string): InputComposerDetection;
 
   /**
    * Get current activity state using agent-native mechanism (JSONL, SQLite, etc.).
