@@ -661,6 +661,65 @@ describe("detectActivity", () => {
 });
 
 // =========================================================================
+// detectStagedInput — Codex composer echo detection
+// =========================================================================
+describe("detectStagedInput", () => {
+  const agent = create();
+
+  it("returns true when Codex composer shows the expected prompt and keybinding footer", () => {
+    const message = [
+      "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+      "Please address each finding below.",
+    ].join("\n");
+
+    expect(
+      agent.detectStagedInput?.(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "Please address each finding below.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+        message,
+      ),
+    ).toBe(true);
+  });
+
+  it("matches later prompt lines when the first line has scrolled out of captured output", () => {
+    const message = [
+      "AO reviewer app-rev-1 found 12 open issues for PR #7.",
+      ...Array.from(
+        { length: 12 },
+        (_, index) => `Review finding ${index + 1}: address the affected code path.`,
+      ),
+      "Final required review fix: update the submit confirmation regression test.",
+    ].join("\n");
+    const output = [
+      "Review finding 11: address the affected code path.",
+      "Review finding 12: address the affected code path.",
+      "Final required review fix: update the submit confirmation regression test.",
+      "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+    ].join("\n");
+
+    expect(output).not.toContain("AO reviewer app-rev-1");
+    expect(agent.detectStagedInput?.(output, message)).toBe(true);
+  });
+
+  it("returns false when the composer footer is present without expected prompt content", () => {
+    const message = "AO reviewer app-rev-1 found 2 open issues for PR #7.";
+
+    expect(
+      agent.detectStagedInput?.(
+        [
+          "Unrelated typed text from a human operator.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+        message,
+      ),
+    ).toBe(false);
+  });
+});
+
+// =========================================================================
 // getActivityState
 // =========================================================================
 describe("getActivityState", () => {

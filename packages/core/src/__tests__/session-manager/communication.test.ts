@@ -199,6 +199,9 @@ describe("send", () => {
       .mockReturnValueOnce("idle")
       .mockReturnValueOnce("active")
       .mockReturnValueOnce("active");
+    const detectStagedInput = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    (mockAgent as Agent & { detectStagedInput: typeof detectStagedInput }).detectStagedInput =
+      detectStagedInput;
     const submitInput = vi.fn().mockResolvedValue(undefined);
     (mockRuntime as Runtime & { submitInput: typeof submitInput }).submitInput = submitInput;
 
@@ -206,6 +209,7 @@ describe("send", () => {
     await sm.send("app-1", message);
 
     expect(mockRuntime.sendMessage).toHaveBeenCalledWith(handle, message);
+    expect(detectStagedInput).toHaveBeenCalledWith(expect.stringContaining("⏎ send"), message);
     expect(submitInput).toHaveBeenCalledWith(handle);
     expect(submitInput).toHaveBeenCalledTimes(1);
   });

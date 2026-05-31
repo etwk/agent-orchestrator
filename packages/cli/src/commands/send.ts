@@ -97,7 +97,7 @@ async function sendViaTmux(tmuxTarget: string, message: string): Promise<void> {
   if (message.includes("\n") || message.length > 200) {
     const bufferName = `ao-${randomUUID()}`;
     const tmpFile = join(tmpdir(), `ao-send-${randomUUID()}.txt`);
-    writeFileSync(tmpFile, message);
+    writeFileSync(tmpFile, message, { encoding: "utf-8", mode: 0o600 });
     try {
       await exec("tmux", ["load-buffer", "-b", bufferName, tmpFile]);
       await exec("tmux", ["paste-buffer", "-p", "-r", "-b", bufferName, "-t", tmuxTarget, "-d"]);

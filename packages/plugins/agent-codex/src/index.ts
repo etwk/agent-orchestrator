@@ -58,6 +58,11 @@ export const manifest = {
 const CODEX_SESSIONS_DIR = join(homedir(), ".codex", "sessions");
 const SESSION_MATCH_SCAN_CHUNK_BYTES = 8192;
 const SESSION_MATCH_SCAN_LINE_LIMIT = 10;
+const CODEX_COMPOSER_SUBMIT_HINT = /(?:⏎|enter|return)\s+(?:send|submit|to\s+(?:send|submit))/i;
+const CODEX_COMPOSER_NEWLINE_HINT = /ctrl\s*\+?\s*j\s+(?:newline|new line)/i;
+const STAGED_INPUT_MIN_DISTINCTIVE_CHARS = 16;
+const STAGED_INPUT_SHORT_EXACT_MAX_CHARS = 80;
+const STAGED_INPUT_SNIPPET_CHARS = 80;
 
 interface CodexTokenUsage {
   input_tokens?: number;
@@ -93,6 +98,71 @@ interface CodexJsonlLine extends CodexJsonlPayload {
   type?: string;
   payload?: CodexJsonlPayload;
   msg?: CodexTokenUsage & { type?: string };
+}
+
+function hasCodexComposerFooter(terminalOutput: string): boolean {
+  return (
+    CODEX_COMPOSER_SUBMIT_HINT.test(terminalOutput) &&
+    CODEX_COMPOSER_NEWLINE_HINT.test(terminalOutput)
+  );
+}
+
+function normalizeComposerEchoText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function addUniqueSnippet(snippets: string[], snippet: string): void {
+  const normalized = normalizeComposerEchoText(snippet);
+  if (normalized && !snippets.includes(normalized)) {
+    snippets.push(normalized);
+  }
+}
+
+function promptEchoSnippets(expectedInput: string): string[] {
+  const lines = expectedInput
+    .split(/\r?\n/)
+    .map((line) => normalizeComposerEchoText(line))
+    .filter((line) => line.length > 0);
+  const snippets: string[] = [];
+
+  for (const line of lines) {
+    if (line.length <= STAGED_INPUT_SNIPPET_CHARS) {
+      addUniqueSnippet(snippets, line);
+      continue;
+    }
+
+    addUniqueSnippet(snippets, line.slice(0, STAGED_INPUT_SNIPPET_CHARS));
+    const middleStart = Math.max(0, Math.floor((line.length - STAGED_INPUT_SNIPPET_CHARS) / 2));
+    addUniqueSnippet(snippets, line.slice(middleStart, middleStart + STAGED_INPUT_SNIPPET_CHARS));
+    addUniqueSnippet(snippets, line.slice(-STAGED_INPUT_SNIPPET_CHARS));
+  }
+
+  const normalizedInput = normalizeComposerEchoText(expectedInput);
+  if (normalizedInput.length <= STAGED_INPUT_SHORT_EXACT_MAX_CHARS) {
+    addUniqueSnippet(snippets, normalizedInput);
+  }
+
+  return snippets;
+}
+
+function isExpectedInputEchoedInCodexComposer(
+  terminalOutput: string,
+  expectedInput: string,
+): boolean {
+  const tail = terminalOutput.split("\n").slice(-20).join("\n");
+  if (!hasCodexComposerFooter(tail)) return false;
+
+  const normalizedTail = normalizeComposerEchoText(tail);
+  const snippets = promptEchoSnippets(expectedInput);
+  const distinctiveSnippets = snippets.filter(
+    (snippet) => snippet.length >= STAGED_INPUT_MIN_DISTINCTIVE_CHARS,
+  );
+
+  if (distinctiveSnippets.length > 0) {
+    return distinctiveSnippets.some((snippet) => normalizedTail.includes(snippet));
+  }
+
+  return snippets.some((snippet) => normalizedTail.includes(snippet));
 }
 
 function getCodexPayload(entry: CodexJsonlLine): CodexJsonlPayload {
@@ -662,13 +732,15 @@ function createCodexAgent(): Agent {
       // footer (for example: "⏎ send Ctrl+J newline ..."). Treat that as idle,
       // not active work, so AO does not mistake an unsubmitted pasted prompt for
       // successful delivery.
-      const hasSubmitHint = /(?:⏎|enter|return)\s+(?:send|submit|to\s+(?:send|submit))/i.test(tail);
-      const hasNewlineHint = /ctrl\s*\+?\s*j\s+(?:newline|new line)/i.test(tail);
-      if (hasSubmitHint && hasNewlineHint) return "idle";
+      if (hasCodexComposerFooter(tail)) return "idle";
 
       // Default to active — specific patterns (esc to interrupt, spinner
       // symbols) all map to "active" so no need to check them individually.
       return "active";
+    },
+
+    detectStagedInput(terminalOutput: string, expectedInput: string): boolean {
+      return isExpectedInputEchoedInCodexComposer(terminalOutput, expectedInput);
     },
 
     async getActivityState(

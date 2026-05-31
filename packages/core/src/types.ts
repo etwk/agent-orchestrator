@@ -501,6 +501,14 @@ export interface Agent {
   detectActivity(terminalOutput: string): ActivityState;
 
   /**
+   * Optional: conservatively detect that terminal output shows the expected
+   * input still staged in the agent's composer, not submitted. Session delivery
+   * confirmation uses this only for targeted submit-only retries; implementations
+   * must return false when the composer echo is uncertain.
+   */
+  detectStagedInput?(terminalOutput: string, expectedInput: string): boolean;
+
+  /**
    * Get current activity state using agent-native mechanism (JSONL, SQLite, etc.).
    * This is the preferred method for activity detection.
    * @param readyThresholdMs - ms before "ready" becomes "idle" (default: DEFAULT_READY_THRESHOLD_MS)
