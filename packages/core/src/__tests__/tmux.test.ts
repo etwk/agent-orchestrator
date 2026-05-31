@@ -171,11 +171,16 @@ describe("sendKeys", () => {
     expect(loadArgs[1]).toBe("-b");
     expect(loadArgs[2]).toMatch(/^ao-/); // named buffer
 
-    // Call 2: paste-buffer with named buffer and -d (delete after paste)
+    // Call 2: paste-buffer with named buffer, bracketed-paste markers, raw LF,
+    // and -d (delete after paste). This keeps multiline prompts in the target
+    // agent composer until the final Enter submits the whole prompt.
     const pasteArgs = mockExecFile.mock.calls[2][1] as string[];
     expect(pasteArgs[0]).toBe("paste-buffer");
-    expect(pasteArgs[1]).toBe("-b");
-    expect(pasteArgs[2]).toMatch(/^ao-/);
+    expect(pasteArgs).toContain("-p");
+    expect(pasteArgs).toContain("-r");
+    const bufferIndex = pasteArgs.indexOf("-b");
+    expect(bufferIndex).toBeGreaterThanOrEqual(0);
+    expect(pasteArgs[bufferIndex + 1]).toMatch(/^ao-/);
     expect(pasteArgs).toContain("-d");
     expect(pasteArgs).toContain("-t");
     expect(pasteArgs).toContain("app-1");

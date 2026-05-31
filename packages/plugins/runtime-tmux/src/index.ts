@@ -17,6 +17,8 @@ import {
 
 const execFileAsync = promisify(execFile);
 const TMUX_COMMAND_TIMEOUT_MS = 5_000;
+const SHORT_MESSAGE_SETTLE_MS = 300;
+const BUFFER_PASTE_SETTLE_MS = 1_000;
 
 export const manifest = {
   name: "tmux",
@@ -65,6 +67,14 @@ async function tmux(...args: string[]): Promise<string> {
     timeout: TMUX_COMMAND_TIMEOUT_MS,
   });
   return stdout.trimEnd();
+}
+
+async function pasteBuffer(bufferName: string, targetPane: string): Promise<void> {
+  // tmux rewrites LF to CR by default, which can turn multiline prompts into
+  // multiple Enter keypresses for TUIs. Preserve raw LF (`-r`) and use
+  // bracketed-paste markers (`-p`) so Codex receives one composer payload; the
+  // explicit final Enter below is the only submit keypress.
+  await tmux("paste-buffer", "-p", "-r", "-b", bufferName, "-t", targetPane, "-d");
 }
 
 export function create(): Runtime {
@@ -162,7 +172,7 @@ export function create(): Runtime {
         writeFileSync(tmpPath, message, { encoding: "utf-8", mode: 0o600 });
         try {
           await tmux("load-buffer", "-b", bufferName, tmpPath);
-          await tmux("paste-buffer", "-b", bufferName, "-t", handle.id, "-d");
+          await pasteBuffer(bufferName, handle.id);
         } finally {
           // Clean up temp file and tmux buffer (in case paste-buffer failed
           // and the -d flag didn't delete it)
@@ -185,7 +195,11 @@ export function create(): Runtime {
 
       // Small delay to let tmux process the pasted text before pressing Enter.
       // Without this, Enter can arrive before the text is fully rendered.
-      await sleep(300);
+      await sleep(
+        message.includes("\n") || message.length > 200
+          ? BUFFER_PASTE_SETTLE_MS
+          : SHORT_MESSAGE_SETTLE_MS,
+      );
       await tmux("send-keys", "-t", handle.id, "Enter");
     },
 
