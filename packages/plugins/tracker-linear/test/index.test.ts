@@ -548,6 +548,26 @@ describe("tracker-linear plugin", () => {
       const body = JSON.parse(writeCall);
       expect(body.variables.first).toBe(30);
     });
+
+    it("uses the oldest Linear page first for FIFO created order", async () => {
+      mockLinearAPI({
+        issues: {
+          nodes: [
+            { ...sampleIssueNode, identifier: "INT-101" },
+            { ...sampleIssueNode, identifier: "INT-100" },
+          ],
+        },
+      });
+
+      const issues = await tracker.listIssues!({ sort: "created-asc", limit: 2 }, project);
+
+      const writeCall = requestMock.mock.results[0].value.write.mock.calls[0][0];
+      const body = JSON.parse(writeCall);
+      expect(body.variables.first).toBeUndefined();
+      expect(body.variables.last).toBe(2);
+      expect(body.variables.orderBy).toBe("createdAt");
+      expect(issues.map((issue) => issue.id)).toEqual(["INT-100", "INT-101"]);
+    });
   });
 
   // ---- updateIssue -------------------------------------------------------

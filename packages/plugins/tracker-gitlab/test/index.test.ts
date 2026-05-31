@@ -323,6 +323,16 @@ describe("tracker-gitlab plugin", () => {
         expect.any(Object),
       );
     });
+
+    it("passes FIFO created order to GitLab", async () => {
+      mockGlab([]);
+      await tracker.listIssues!({ sort: "created-asc" }, project);
+      expect(glabMock).toHaveBeenCalledWith(
+        "glab",
+        expect.arrayContaining(["--order", "created_at", "--sort", "asc"]),
+        expect.any(Object),
+      );
+    });
   });
 
   // ---- updateIssue -------------------------------------------------------

@@ -420,6 +420,16 @@ describe("tracker-github plugin", () => {
       );
     });
 
+    it("passes FIFO created order through GitHub search sort", async () => {
+      mockGh([]);
+      await tracker.listIssues!({ sort: "created-asc" }, project);
+      expect(ghMock).toHaveBeenCalledWith(
+        expect.stringMatching(/(?:^|[\\/])gh(?:\.(?:exe|cmd|bat))?$/i),
+        expect.arrayContaining(["--search", "sort:created-asc"]),
+        expect.any(Object),
+      );
+    });
+
     it("falls back to legacy JSON fields when stateReason is unsupported", async () => {
       mockGhError('gh issue list failed: Unknown JSON field "stateReason"');
       mockGh([{ ...sampleIssue, stateReason: undefined }]);

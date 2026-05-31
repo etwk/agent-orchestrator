@@ -512,14 +512,25 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         filter["team"] = { id: { eq: teamId } };
       }
 
+      const oldestFirst = filters.sort === "created-asc";
+      const limit = filters.limit ?? 30;
+
       variables["filter"] = Object.keys(filter).length > 0 ? filter : undefined;
-      variables["first"] = filters.limit ?? 30;
+      variables["orderBy"] = oldestFirst ? "createdAt" : undefined;
+      if (oldestFirst) {
+        // Linear's createdAt pagination returns the newest-created page first by
+        // default. Request the last page, then reverse it so callers receive the
+        // oldest matching issues first.
+        variables["last"] = limit;
+      } else {
+        variables["first"] = limit;
+      }
 
       const data = await query<{
         issues: { nodes: LinearIssueNode[] };
       }>(
-        `query($filter: IssueFilter, $first: Int!) {
-          issues(filter: $filter, first: $first) {
+        `query($filter: IssueFilter, $first: Int, $last: Int, $orderBy: PaginationOrderBy) {
+          issues(filter: $filter, first: $first, last: $last, orderBy: $orderBy) {
             nodes {
               ${ISSUE_FIELDS}
             }
@@ -528,7 +539,9 @@ function createLinearTracker(query: GraphQLTransport): Tracker {
         variables,
       );
 
-      return data.issues.nodes.map((node) => ({
+      const nodes = oldestFirst ? [...data.issues.nodes].reverse() : data.issues.nodes;
+
+      return nodes.map((node) => ({
         id: node.identifier,
         title: node.title,
         description: node.description ?? "",

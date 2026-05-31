@@ -758,6 +758,8 @@ export interface IssueFilters {
   labels?: string[];
   assignee?: string;
   limit?: number;
+  /** Requested tracker ordering. `created-asc` is FIFO within the returned tracker page. */
+  sort?: "created-asc";
 }
 
 export interface IssueUpdate {

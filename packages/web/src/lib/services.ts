@@ -342,8 +342,10 @@ async function pollBacklogOnce(): Promise<void> {
 
       let backlogIssues: Issue[];
       try {
+        // FIFO is requested per project/tracker before the tracker applies its
+        // page limit. Cross-project fairness still follows config project order.
         backlogIssues = await tracker.listIssues(
-          { state: "open", labels: [BACKLOG_LABEL], limit: 10 },
+          { state: "open", labels: [BACKLOG_LABEL], limit: 10, sort: "created-asc" },
           project,
         );
       } catch {

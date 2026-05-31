@@ -312,6 +312,10 @@ function createGitHubTracker(): Tracker {
         args.push("--assignee", filters.assignee);
       }
 
+      if (filters.sort === "created-asc") {
+        args.push("--search", "sort:created-asc");
+      }
+
       const raw = await ghIssueListJson(args);
       const issues: Array<{
         number: number;

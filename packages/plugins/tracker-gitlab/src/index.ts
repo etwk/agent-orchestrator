@@ -148,6 +148,10 @@ function createGitLabTracker(config?: Record<string, unknown>): Tracker {
         args.push("--assignee", filters.assignee);
       }
 
+      if (filters.sort === "created-asc") {
+        args.push("--order", "created_at", "--sort", "asc");
+      }
+
       const raw = await glab(args, hostname);
       const issues = parseJSON<GitLabIssueData[]>(raw, "listIssues");
       return issues.map(toIssue);
