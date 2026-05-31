@@ -602,6 +602,18 @@ describe("detectActivity", () => {
     expect(agent.detectActivity("Working on task (esc to interrupt)\nFinished.\n$ ")).toBe("idle");
   });
 
+  it("returns idle when Codex shows typed composer text and submit/newline hints", () => {
+    expect(
+      agent.detectActivity(
+        [
+          "AO reviewer app-rev-1 found 2 open issues for PR #7.",
+          "Please address each finding below.",
+          "⏎ send   Ctrl+J newline   Ctrl+T transcript   Ctrl+C quit",
+        ].join("\n"),
+      ),
+    ).toBe("idle");
+  });
+
   // -- Waiting input states --
   it("returns waiting_input for approval required text", () => {
     expect(agent.detectActivity("some output\napproval required\n")).toBe("waiting_input");

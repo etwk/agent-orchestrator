@@ -328,6 +328,35 @@ async function getTmuxForegroundCommand(sessionName: string): Promise<string | n
   }
 }
 
+function normalizeComposerEchoText(value: string): string {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function firstPromptLinePreview(message: string): string {
+  const firstLine = message
+    .split(/\r?\n/)
+    .map((line) => normalizeComposerEchoText(line))
+    .find((line) => line.length > 0);
+  return firstLine ? firstLine.slice(0, 80) : "";
+}
+
+function isLikelyUnsubmittedCodexComposer(
+  agentName: string,
+  output: string,
+  message: string,
+): boolean {
+  if (agentName !== "codex") return false;
+
+  const tail = output.split("\n").slice(-8).join("\n");
+  const hasSubmitHint = /(?:⏎|enter|return)\s+(?:send|submit|to\s+(?:send|submit))/i.test(tail);
+  const hasNewlineHint = /ctrl\s*\+?\s*j\s+(?:newline|new line)/i.test(tail);
+  if (!hasSubmitHint || !hasNewlineHint) return false;
+
+  const preview = firstPromptLinePreview(message);
+  if (!preview) return true;
+  return normalizeComposerEchoText(output).includes(preview);
+}
+
 /** Parse lifecycle from raw metadata for writeMetadata (restore path). */
 function parseLifecycleFromRaw(raw: Record<string, string>): CanonicalSessionLifecycle | undefined {
   const source = raw["lifecycle"] ?? raw["statePayload"];
@@ -3528,6 +3557,7 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
 
       await runtimePlugin.sendMessage(handle, message);
 
+      let submitRetrySent = false;
       for (let attempt = 1; attempt <= SEND_CONFIRMATION_ATTEMPTS; attempt++) {
         // Sleep before each check (including the first) so the runtime has time
         // to reflect the message in its output.
@@ -3536,17 +3566,30 @@ export function createSessionManager(deps: SessionManagerDeps): OpenCodeSessionM
         const output = await captureOutput(handle);
         const activity = detectActivityFromOutput(output) ?? session.activity;
         const updatedAt = await getOpenCodeSessionUpdatedAt();
+        const unsubmittedComposer = isLikelyUnsubmittedCodexComposer(agentName, output, message);
         const delivered =
           (baselineUpdatedAt !== undefined &&
             updatedAt !== undefined &&
             updatedAt > baselineUpdatedAt) ||
           hasQueuedMessage(output) ||
-          (output.length > 0 && output !== baselineOutput) ||
-          (baselineActivity !== "active" && activity === "active") ||
-          (baselineActivity !== "waiting_input" && activity === "waiting_input");
+          (!unsubmittedComposer && output.length > 0 && output !== baselineOutput) ||
+          (!unsubmittedComposer && baselineActivity !== "active" && activity === "active") ||
+          (!unsubmittedComposer &&
+            baselineActivity !== "waiting_input" &&
+            activity === "waiting_input");
 
         if (delivered) {
           return;
+        }
+
+        if (unsubmittedComposer && !submitRetrySent && runtimePlugin.submitInput) {
+          submitRetrySent = true;
+          try {
+            await runtimePlugin.submitInput(handle);
+          } catch {
+            // Keep the existing soft-success behavior if the targeted submit
+            // retry cannot run; the original send already happened.
+          }
         }
       }
 

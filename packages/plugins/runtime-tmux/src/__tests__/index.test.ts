@@ -562,6 +562,24 @@ describe("runtime.sendMessage()", () => {
   });
 });
 
+describe("runtime.submitInput()", () => {
+  it("presses Enter without clearing or writing input", async () => {
+    const runtime = create();
+    const handle = makeHandle("submit-only");
+
+    mockTmuxSuccess();
+
+    await runtime.submitInput?.(handle);
+
+    expect(mockExecFileCustom).toHaveBeenCalledTimes(1);
+    expect(mockExecFileCustom).toHaveBeenCalledWith(
+      "tmux",
+      ["send-keys", "-t", "submit-only", "Enter"],
+      expectedTmuxOptions,
+    );
+  });
+});
+
 describe("runtime.getOutput()", () => {
   it("calls capture-pane with correct args and default lines", async () => {
     const runtime = create();

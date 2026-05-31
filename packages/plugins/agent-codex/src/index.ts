@@ -658,6 +658,14 @@ function createCodexAgent(): Agent {
       if (/approval required/i.test(tail)) return "waiting_input";
       if (/\(y\)es.*\(n\)o/i.test(tail)) return "waiting_input";
 
+      // Codex's idle composer can include already-typed text plus its keybinding
+      // footer (for example: "⏎ send Ctrl+J newline ..."). Treat that as idle,
+      // not active work, so AO does not mistake an unsubmitted pasted prompt for
+      // successful delivery.
+      const hasSubmitHint = /(?:⏎|enter|return)\s+(?:send|submit|to\s+(?:send|submit))/i.test(tail);
+      const hasNewlineHint = /ctrl\s*\+?\s*j\s+(?:newline|new line)/i.test(tail);
+      if (hasSubmitHint && hasNewlineHint) return "idle";
+
       // Default to active — specific patterns (esc to interrupt, spinner
       // symbols) all map to "active" so no need to check them individually.
       return "active";

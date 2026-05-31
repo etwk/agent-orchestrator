@@ -396,6 +396,14 @@ export interface Runtime {
   /** Send a text message/prompt to the running agent */
   sendMessage(handle: RuntimeHandle, message: string): Promise<void>;
 
+  /**
+   * Optional: submit whatever is already staged in the runtime input area
+   * without modifying it. Runtimes with terminal semantics can use this for a
+   * targeted retry when a prior long paste reached the composer but the final
+   * submit keypress was not observed by the agent.
+   */
+  submitInput?(handle: RuntimeHandle): Promise<void>;
+
   /** Capture recent output from the session */
   getOutput(handle: RuntimeHandle, lines?: number): Promise<string>;
 
