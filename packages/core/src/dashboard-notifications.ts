@@ -1,4 +1,12 @@
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import type { NotifyAction, OrchestratorEvent } from "./types.js";
 import type { NotificationDataV3 } from "./notification-data.js";
@@ -7,6 +15,9 @@ import { getObservabilityBaseDir } from "./paths.js";
 
 export const DEFAULT_DASHBOARD_NOTIFICATION_LIMIT = 50;
 export const MAX_DASHBOARD_NOTIFICATION_LIMIT = 500;
+const APPEND_LOCK_STALE_MS = 30_000;
+const APPEND_LOCK_RETRIES = 100;
+const APPEND_LOCK_RETRY_DELAY_MS = 10;
 
 export interface LegacyDashboardNotificationData {
   [key: string]: unknown;
@@ -81,6 +92,55 @@ function serializeAction(action: NotifyAction): SerializedDashboardAction {
       ? { callbackEndpoint: action.callbackEndpoint }
       : {}),
   };
+}
+
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  // Synchronous notification appends need a synchronous wait while another
+  // AO process owns the store lock. Atomics.wait blocks without spinning the
+  // event loop CPU.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function removeStaleAppendLock(lockPath: string): void {
+  try {
+    const stat = statSync(lockPath);
+    if (Date.now() - stat.mtimeMs > APPEND_LOCK_STALE_MS) {
+      rmSync(lockPath, { force: true });
+    }
+  } catch {
+    // Missing/unreadable lock state should not prevent the normal retry path.
+  }
+}
+
+function withAppendLock<T>(filePath: string, fn: () => T): T {
+  const lockPath = `${filePath}.lock`;
+  mkdirSync(dirname(filePath), { recursive: true });
+
+  let fd: number | null = null;
+  for (let attempt = 0; attempt <= APPEND_LOCK_RETRIES; attempt++) {
+    try {
+      fd = openSync(lockPath, "wx");
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") throw error;
+      removeStaleAppendLock(lockPath);
+      if (attempt === APPEND_LOCK_RETRIES) throw error;
+      sleepSync(APPEND_LOCK_RETRY_DELAY_MS);
+    }
+  }
+
+  if (fd === null) {
+    throw new Error(`Could not acquire dashboard notification append lock: ${lockPath}`);
+  }
+
+  try {
+    return fn();
+  } finally {
+    closeSync(fd);
+    rmSync(lockPath, { force: true });
+  }
 }
 
 export function createDashboardNotificationRecord(
@@ -178,8 +238,10 @@ export function appendDashboardNotificationRecord(
   record: DashboardNotificationRecord,
   limit: unknown = DEFAULT_DASHBOARD_NOTIFICATION_LIMIT,
 ): DashboardNotificationRecord {
-  const existing = readDashboardNotificationsFromFile(filePath, limit);
-  writeDashboardNotificationsToFile(filePath, [...existing, record], limit);
+  withAppendLock(filePath, () => {
+    const existing = readDashboardNotificationsFromFile(filePath, limit);
+    writeDashboardNotificationsToFile(filePath, [...existing, record], limit);
+  });
   return record;
 }
 

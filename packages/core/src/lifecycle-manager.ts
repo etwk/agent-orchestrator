@@ -1189,14 +1189,16 @@ export function createLifecycleManager(deps: LifecycleManagerDeps): LifecycleMan
           reason: "probe_indeterminate",
         },
       });
-      return {
-        status: session.status,
-        evidence: session.metadata["lifecycleEvidence"] ?? "process_probe_indeterminate",
-        detectingAttempts: currentDetectingAttempts,
-        detectingStartedAt: currentDetectingStartedAt,
-        detectingEvidenceHash: currentDetectingEvidenceHash,
-        skipMetadataWrite: true,
-      };
+      if (runtimeProbe.state !== "dead") {
+        return {
+          status: session.status,
+          evidence: session.metadata["lifecycleEvidence"] ?? "process_probe_indeterminate",
+          detectingAttempts: currentDetectingAttempts,
+          detectingStartedAt: currentDetectingStartedAt,
+          detectingEvidenceHash: currentDetectingEvidenceHash,
+          skipMetadataWrite: true,
+        };
+      }
     }
 
     const probeDecision = resolveProbeDecision({

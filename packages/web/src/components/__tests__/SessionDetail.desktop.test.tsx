@@ -304,7 +304,7 @@ describe("SessionDetail desktop layout", () => {
     );
   });
 
-  it("does not open a blank terminal when activity exited but lifecycle still reports alive", () => {
+  it("keeps live lifecycle sessions open when activity has a stale exited marker", async () => {
     render(
       <SessionDetail
         session={makeSession({
@@ -350,14 +350,14 @@ describe("SessionDetail desktop layout", () => {
       />,
     );
 
-    expect(screen.getByRole("region", { name: "Session ended summary" })).toBeInTheDocument();
-    expect(screen.getByText("Terminal ended")).toBeInTheDocument();
-    expect(screen.queryByTestId("direct-terminal")).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Session ended summary" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Terminal ended")).not.toBeInTheDocument();
+    expect(await screen.findByTestId("direct-terminal")).toHaveTextContent("worker-review-ended");
     expect(
-      within(screen.getByRole("banner")).getByRole("button", {
+      within(screen.getByRole("banner")).queryByRole("button", {
         name: "Restore worker-review-ended",
       }),
-    ).toBeInTheDocument();
+    ).not.toBeInTheDocument();
   });
 
   it("keeps restore in the ended summary but not the top bar for restorable orchestrators", () => {

@@ -1,7 +1,12 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import chalk from "chalk";
 import { parseDocument } from "yaml";
-import { CONFIG_SCHEMA_URL, findConfigFile, isCanonicalGlobalConfigPath } from "@aoagents/ao-core";
+import {
+  CONFIG_SCHEMA_URL,
+  findConfigFile,
+  getGlobalConfigPath,
+  isCanonicalGlobalConfigPath,
+} from "@aoagents/ao-core";
 import {
   applyNotifierRoutingPreset,
   getNotifierRoutingState,
@@ -76,10 +81,18 @@ function validateSlackWebhookUrl(webhookUrl: string): void {
 }
 
 function readConfigContext(): ConfigContext {
-  const configPath = findConfigFile() ?? undefined;
-  if (!configPath) {
+  const discoveredConfigPath = findConfigFile() ?? undefined;
+  if (!discoveredConfigPath) {
     throw new SlackSetupError(
       "No agent-orchestrator.yaml found. Run 'ao start' first to create one.",
+    );
+  }
+  const configPath = isCanonicalGlobalConfigPath(discoveredConfigPath)
+    ? discoveredConfigPath
+    : getGlobalConfigPath();
+  if (!existsSync(configPath)) {
+    throw new SlackSetupError(
+      "Slack notifier setup writes to the global AO config. Run 'ao start' first to register this project.",
     );
   }
 
@@ -425,7 +438,8 @@ async function resolveInteractiveSetup(
     const resolvedWebhookUrl = await resolveInteractiveWebhookUrl(clack, opts, existingWebhookUrl);
 
     const channelInput = await clack.text({
-      message: "Channel name (optional; must match the channel selected when creating the webhook):",
+      message:
+        "Channel name (optional; must match the channel selected when creating the webhook):",
       placeholder: "#agents",
       initialValue: stringValue(opts.channel) ?? stringValue(existingSlack["channel"]),
     });
@@ -478,7 +492,8 @@ function resolveNonInteractiveSetup(
   const channel = stringValue(opts.channel) ?? stringValue(existingSlack["channel"]);
   const username =
     stringValue(opts.username) ?? stringValue(existingSlack["username"]) ?? DEFAULT_USERNAME;
-  const routingPreset = resolveSlackRoutingPreset(opts.routingPreset) ?? (opts.refresh ? undefined : "all");
+  const routingPreset =
+    resolveSlackRoutingPreset(opts.routingPreset) ?? (opts.refresh ? undefined : "all");
   return buildResolvedSetup(webhookUrl, channel, username, routingPreset, opts);
 }
 
@@ -574,7 +589,9 @@ async function printStatus(): Promise<void> {
   if (plugin !== "slack" || !webhookUrl) return;
 
   try {
-    await sendSetupProbe(buildResolvedSetup(webhookUrl, channel, username, undefined, { test: true }));
+    await sendSetupProbe(
+      buildResolvedSetup(webhookUrl, channel, username, undefined, { test: true }),
+    );
     console.log(chalk.green("  Probe: PASS"));
   } catch (error) {
     console.log(

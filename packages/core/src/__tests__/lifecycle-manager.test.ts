@@ -729,6 +729,31 @@ describe("check (single session)", () => {
     expect(lm.getStates().get("app-1")).toBe("working");
   });
 
+  it("still records runtime loss when runtime is dead but the process probe is indeterminate", async () => {
+    vi.mocked(plugins.runtime.isAlive).mockResolvedValue(false);
+    vi.mocked(plugins.agent.getActivityState).mockResolvedValue(null);
+    vi.mocked(plugins.agent.detectActivity).mockReturnValue("idle");
+    vi.mocked(plugins.agent.isProcessRunning).mockResolvedValue("indeterminate");
+
+    const lm = setupCheck("app-1", {
+      session: makeSession({
+        status: "working",
+        metadata: { lifecycleEvidence: "previous_evidence", detectingAttempts: "1" },
+      }),
+      metaOverrides: {
+        lifecycleEvidence: "previous_evidence",
+        detectingAttempts: "1",
+      },
+    });
+
+    await lm.check("app-1");
+
+    expect(lm.getStates().get("app-1")).toBe("detecting");
+    const meta = readMetadataRaw(env.sessionsDir, "app-1");
+    expect(meta?.["lifecycleEvidence"]).toContain("runtime_dead process_unknown");
+    expect(meta?.["detectingAttempts"]).toBe("2");
+  });
+
   it("does not mark a session stuck from terminal-only idle evidence without a timestamp", async () => {
     config.reactions = {
       "agent-stuck": { auto: true, action: "notify", threshold: "1m" },
@@ -2423,7 +2448,9 @@ describe("reactions", () => {
     const sentMessage = vi.mocked(mockSessionManager.send).mock.calls[0]![1];
     expect(sentMessage).toContain("CI is failing on your PR.");
     expect(sentMessage).toContain("Failed: build → Run pnpm test");
-    expect(sentMessage).toContain("Failure URL: https://github.com/org/repo/actions/runs/123/job/456");
+    expect(sentMessage).toContain(
+      "Failure URL: https://github.com/org/repo/actions/runs/123/job/456",
+    );
     expect(sentMessage).toContain("Log tail (last 3 lines):");
     expect(sentMessage).toContain("AssertionError: expected true to be false");
     expect(sentMessage).toContain("\u200B```");

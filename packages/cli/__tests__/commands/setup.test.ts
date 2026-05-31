@@ -3516,6 +3516,9 @@ describe("setup slack command", () => {
     mockFindConfigFile.mockReturnValue("/tmp/agent-orchestrator.yaml");
     mockReadFileSync.mockReturnValue(MINIMAL_CONFIG);
     mockWriteFileSync.mockImplementation(() => {});
+    mockExistsSync.mockImplementation(
+      (path: string) => path === join(homedir(), ".agent-orchestrator", "config.yaml"),
+    );
     mockFetch.mockReset();
     mockFetch.mockResolvedValue({
       ok: true,
@@ -3534,6 +3537,7 @@ describe("setup slack command", () => {
 
   afterEach(() => {
     process.env = { ...originalEnv };
+    mockExistsSync.mockReset();
     vi.unstubAllGlobals();
   });
 
@@ -3736,6 +3740,25 @@ projects:
     expect(parsed.notificationRouting?.["action"]).toContain("slack");
     expect(parsed.notificationRouting?.["warning"]).toContain("slack");
     expect(parsed.notificationRouting?.["info"]).toContain("slack");
+  });
+
+  it("writes Slack notifier setup to the global config when started from a project config", async () => {
+    const program = createProgram();
+
+    await program.parseAsync([
+      "node",
+      "test",
+      "setup",
+      "slack",
+      "--webhook-url",
+      SLACK_SECRET_WEBHOOK_URL,
+      "--no-test",
+      "--non-interactive",
+    ]);
+
+    expect(mockWriteFileSync.mock.calls[0][0]).toBe(
+      join(homedir(), ".agent-orchestrator", "config.yaml"),
+    );
   });
 
   it("writes optional channel and username when provided", async () => {
